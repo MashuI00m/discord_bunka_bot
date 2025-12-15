@@ -12,3 +12,5 @@ gunicorn
 psycopg2-binary 
 # DB操作を簡単にするORM（推奨）
 SQLAlchemy
+
+requests
