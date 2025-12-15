@@ -1,33 +1,67 @@
 import os
-from flask import Flask
+import sys
+import re 
 from threading import Thread
+from flask import Flask
 import discord
 from discord.ext import commands
-import re # 正規表現を使うためのライブラリ
+
+# --- DB/SQLAlchemy 関連のインポート ---
+from sqlalchemy import create_engine, Column, String, Integer
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.exc import OperationalError, SQLAlchemyError 
+# ------------------------------------
+
+# --- DB接続設定 ---
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    print("WARNING: DATABASE_URL 環境変数が設定されていません。DB機能は無効です。", file=sys.stderr)
+
+# データベースエンジンの初期化 (Bot起動時に一度だけ実行される)
+engine = None
+Session = None
+Base = declarative_base()
+
+if DATABASE_URL:
+    try:
+        engine = create_engine(DATABASE_URL)
+        Session = sessionmaker(bind=engine)
+        print("データベース接続エンジンを初期化しました。")
+    except Exception as e:
+        print(f"FATAL ERROR: DB接続エンジンの初期化に失敗しました: {e}", file=sys.stderr)
+        # 接続失敗時もBotは起動させるため、sys.exit(1)はコメントアウト
+
+# --- DBテーブル定義 ---
+class OrgSettings(Base):
+    """許可された団体名を保存するテーブル"""
+    __tablename__ = 'allowed_organizations'
+    
+    id = Column(Integer, primary_key=True)
+    org_name = Column(String, unique=True, nullable=False)
+
+    def __repr__(self):
+        return f"<OrgSettings(org_name='{self.org_name}')>"
 
 # --- Flask Webサーバーの設定 ---
-
-app = Flask('main')
+app = Flask(__name__) # '__name__' に修正 ('main' ではなく標準的な記述)
 
 # ルートURL（"/"）にアクセスがあったときに実行される関数
 @app.route('/')
 def home():
-    # 監視サービスに「生きているよ」と伝えるための応答
     return "Bot is alive!"
 
-# Flaskサーバーを別スレッドで実行するための関数
-# Botのメイン処理をブロックしないようにするため
 def run_server():
-    # Renderが環境変数 'PORT' で指定するポートを使用する
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    # gunicornがサーバー起動を担うため、app.run()は不要またはコメントアウトが推奨されます
+    # app.run(host='0.0.0.0', port=port)
+    pass 
 
-# サーバー起動をBotの起動前に呼び出す関数
 def keep_alive():
     t = Thread(target=run_server)
     t.start()
 
-# --- 設定 ---
+# --- Bot設定 ---
 LOG_CHANNEL_NAME = '管理ログ'
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -40,7 +74,29 @@ intents.members = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
-allowed_orgs = set()
+# 許可された団体名リストはDBから取得するロジックに変更するため、ここは一時的に不要
+# allowed_orgs = set() 
+
+# --- DB操作関数 ---
+
+def get_allowed_orgs():
+    """DBから許可された団体名のリスト（セット）を取得する"""
+    if not Session:
+        return set()
+    session = Session()
+    try:
+        # DBに保存されているすべての団体名を取得し、セットに変換
+        orgs = session.query(OrgSettings.org_name).all()
+        return set(o[0] for o in orgs)
+    except OperationalError as e:
+        # テーブルが存在しない、または接続エラーの場合
+        print(f"DB Operational Error: {e}")
+        return set()
+    except SQLAlchemyError as e:
+        print(f"DB Error during fetching organizations: {e}")
+        return set()
+    finally:
+        session.close()
 
 # ---------------------------------------------------------
 # ボタンの定義 (View)
@@ -57,6 +113,9 @@ class RoleCheckView(discord.ui.View):
         guild = interaction.guild
         display_name = user.display_name
         
+        # 実行時に最新の団体名リストをDBから取得
+        allowed_orgs = get_allowed_orgs() # DBから取得！
+        
         # 結果メッセージ用変数
         result_msg = ""
         is_success = False
@@ -69,9 +128,10 @@ class RoleCheckView(discord.ui.View):
         else:
             org_name = match.group(1).strip()
 
-            if org_name not in allowed_orgs:
+            if org_name not in allowed_orgs: # DBから取得したリストと照合
                 result_msg = f'🚫 団体名「{org_name}」は登録されていません。管理者に連絡してください。'
             else:
+                # ... (既存のロール/チャンネル処理ロジックはそのまま) ...
                 # 1. ロール処理
                 role = discord.utils.get(guild.roles, name=org_name)
                 created_new_role = False
@@ -103,7 +163,6 @@ class RoleCheckView(discord.ui.View):
         await interaction.followup.send(result_msg, ephemeral=True)
 
         # --- 2. 管理者への報告 (指定チャンネルに書き込む) ---
-        # 成功したとき、またはエラーのときなど、報告したい内容を調整できます
         if is_success: 
             log_channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
             if log_channel:
@@ -113,7 +172,7 @@ class RoleCheckView(discord.ui.View):
                 await log_channel.send(embed=embed)
 
 async def ensure_org_channel(guild, role, org_name):
-    """ロール専用チャンネルの確認・作成（interaction不要版）"""
+    # (既存のチャンネル作成ロジックは変更なし)
     channel_name = org_name.lower().replace(" ", "-")
     existing_channel = discord.utils.get(guild.text_channels, name=channel_name)
 
@@ -129,17 +188,24 @@ async def ensure_org_channel(guild, role, org_name):
         try:
             await guild.create_text_channel(channel_name, overwrites=overwrites)
         except:
-            pass # ログ出力は呼び出し元で行うなど調整可
+            pass 
 
 # --- Bot起動・コマンド ---
 
 @bot.event
 async def on_ready():
+    if engine:
+        # データベースにテーブルが存在しない場合、ここで作成
+        Base.metadata.create_all(engine)
+        print("DBテーブル構造を確認・作成しました。")
+    
     bot.add_view(RoleCheckView())
     print(f'{bot.user} 起動完了')
 
+
 @bot.command()
 async def panel(ctx):
+    # (コマンドロジックは変更なし)
     embed = discord.Embed(
         title="所属確認・ロール付与",
         description="下のボタンを押すと、名前に応じたロールと個室を自動で用意します。",
@@ -149,26 +215,43 @@ async def panel(ctx):
 
 @bot.command()
 async def add_org(ctx, org_name: str):
-    allowed_orgs.add(org_name)
-    await ctx.send(f'✅ 団体名リストに「{org_name}」を追加しました。')
+    if not Session:
+        await ctx.send('❌ データベース接続が確立されていません。')
+        return
+        
+    session = Session()
+    try:
+        # DBに新しい団体名を追加
+        if session.query(OrgSettings).filter_by(org_name=org_name).first():
+            await ctx.send(f'⚠️ 団体名「{org_name}」は既に登録されています。')
+        else:
+            new_org = OrgSettings(org_name=org_name)
+            session.add(new_org)
+            session.commit()
+            await ctx.send(f'✅ 団体名リスト（DB）に「{org_name}」を追加しました。')
+    except Exception as e:
+        session.rollback()
+        await ctx.send(f'❌ DBへの書き込みに失敗しました: {e}')
+    finally:
+        session.close()
 
 @bot.command()
 async def list_orgs(ctx):
-    if allowed_orgs:
-        await ctx.send(f'📋 **登録済み団体名:**\n' + "\n".join(allowed_orgs))
+    allowed_orgs_list = get_allowed_orgs() # DBから取得
+    if allowed_orgs_list:
+        await ctx.send(f'📋 **登録済み団体名 (DBから取得):**\n' + "\n".join(allowed_orgs_list))
     else:
-        await ctx.send('現在登録されている団体名はありません。')
+        await ctx.send('現在登録されている団体名はありません。（またはDB接続エラー）')
 
+# --- 最終起動処理 ---
 keep_alive()
 
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") 
+# トークン取得は既に上のほうで行われているため、ここではBotの実行のみ
 if DISCORD_TOKEN:
     try:
-        # トークンを使用してBotを起動
         bot.run(DISCORD_TOKEN)
     except discord.errors.LoginFailure:
-        print("FATAL ERROR: 無効なトークンが設定されています。")
+        print("FATAL ERROR: 無効なトークンが設定されています。", file=sys.stderr)
     except Exception as e:
-        print(f"FATAL ERROR: 予期せぬエラーが発生しました: {e}")
-else:
-    print("FATAL ERROR: DISCORD_TOKEN 環境変数が設定されていません。")
+        print(f"FATAL ERROR: 予期せぬエラーが発生しました: {e}", file=sys.stderr)
+# else の処理は上のほうで sys.exit(1) により実行済み
