@@ -1,10 +1,13 @@
 import os
 from flask import Flask
 from threading import Thread
+import discord
+from discord.ext import commands
+import re # 正規表現を使うためのライブラリ
 
 # --- Flask Webサーバーの設定 ---
 
-app = Flask('')
+app = Flask('main')
 
 # ルートURL（"/"）にアクセスがあったときに実行される関数
 @app.route('/')
@@ -23,12 +26,14 @@ def run_server():
 def keep_alive():
     t = Thread(target=run_server)
     t.start()
-import discord
-from discord.ext import commands
-import re # 正規表現を使うためのライブラリ
 
 # --- 設定 ---
 LOG_CHANNEL_NAME = '管理ログ'
+
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+if DISCORD_TOKEN is None:
+    print("FATAL ERROR: DISCORD_TOKEN 環境変数が設定されていません。", file=sys.stderr)
+    sys.exit(1)
 
 intents = discord.Intents.default()
 intents.members = True
@@ -153,6 +158,8 @@ async def list_orgs(ctx):
         await ctx.send(f'📋 **登録済み団体名:**\n' + "\n".join(allowed_orgs))
     else:
         await ctx.send('現在登録されている団体名はありません。')
+
+keep_alive()
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") 
 if DISCORD_TOKEN:
