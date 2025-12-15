@@ -1,7 +1,7 @@
 import os
 import sys
 import re 
-from threading import Thread # スレッド処理を再導入
+from threading import Thread
 from flask import Flask
 import discord
 from discord.ext import commands
@@ -45,24 +45,15 @@ class OrgSettings(Base):
 # --- Flask Webサーバーの設定 ---
 app = Flask(__name__) 
 
-# ルートURL（"/"）にアクセスがあったときに実行される関数 (Renderのヘルスチェック用)
 @app.route('/')
 def home():
     return "Bot is alive!"
 
-# --- ポートバインドのためのWebサーバー起動関数を復元 ---
 def run_server():
-    # Renderが環境変数 'PORT' で指定するポートを使用する
     port = int(os.environ.get("PORT", 5000))
-    # Flaskアプリを別スレッドで起動する
-    # host='0.0.0.0' は外部からのアクセスを許可するために必須
-    # gunicornを使う場合、この行は競合を避けるためにコメントアウトまたは削除が推奨されますが、
-    # 確実なポートバインドのため、ここでは実行します。
-    # ただし、Start Commandを `gunicorn main:app` から `python main.py` に変える必要があります。
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    """Botの起動とは別に、Webサーバーを別スレッドで起動する"""
     t = Thread(target=run_server)
     t.start()
 # ----------------------------------------------------
@@ -101,7 +92,7 @@ def get_allowed_orgs():
         session.close()
 
 # ---------------------------------------------------------
-# ボタンの定義 (View) (変更なし)
+# ボタンの定義 (View)
 # ---------------------------------------------------------
 class RoleCheckView(discord.ui.View):
     def __init__(self):
@@ -119,6 +110,7 @@ class RoleCheckView(discord.ui.View):
         
         result_msg = ""
         is_success = False
+        removed_roles = [] # 剥奪したロール名を記録するリスト
 
         match = re.search(r'[@＠](.+)$', display_name)
         
@@ -126,10 +118,24 @@ class RoleCheckView(discord.ui.View):
             result_msg = f'⚠️ 名前に「@団体名」がありません。\nニックネームを「名前@団体名」にしてから再度押してください。'
         else:
             org_name = match.group(1).strip()
+            
+            # --- ロール剥奪ロジック ---
+            # DBに登録されている全ての団体名ロールを探し、現在の org_name と一致しないものを剥奪する
+            for user_role in user.roles:
+                # ユーザーが持っているロールの名前が、allowed_orgs（DB登録団体）に含まれているかチェック
+                if user_role.name in allowed_orgs and user_role.name != org_name:
+                    try:
+                        await user.remove_roles(user_role)
+                        removed_roles.append(user_role.name)
+                    except discord.Forbidden:
+                        # 剥奪権限がない場合、処理を中断せずログを残す
+                        print(f"ERROR: Bot lacks permission to remove role {user_role.name} from {user.display_name}")
 
+            # --- ロール付与ロジック ---
             if org_name not in allowed_orgs:
                 result_msg = f'🚫 団体名「{org_name}」は登録されていません。管理者に連絡してください。'
             else:
+                # 1. ロール処理（作成または取得）
                 role = discord.utils.get(guild.roles, name=org_name)
                 created_new_role = False
 
@@ -141,6 +147,7 @@ class RoleCheckView(discord.ui.View):
                     except discord.Forbidden:
                         result_msg = '❌ エラー: Botにロールを作成する権限がありません。'
                         
+                # 2. 付与処理（ロールが存在する場合のみ進む）
                 if role:
                     if role not in user.roles:
                         try:
@@ -155,9 +162,16 @@ class RoleCheckView(discord.ui.View):
                         result_msg = f'✅ 既にロール「{role.name}」を持っています。'
                         is_success = True
 
+        # --- 結果メッセージの組み立て ---
+        if removed_roles:
+            removal_info = " ".join(removed_roles)
+            result_msg += f'\n(🗑️ 以下の不要な団体ロールを剥奪しました: {removal_info})'
+            
+        # --- 1. ユーザーへの返信 (自分だけ見える) ---
         await interaction.followup.send(result_msg, ephemeral=True)
 
-        if is_success: 
+        # --- 2. 管理者への報告 (指定チャンネルに書き込む) ---
+        if is_success or removed_roles: 
             log_channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
             if log_channel:
                 embed = discord.Embed(title="🤖 自動処理ログ", color=discord.Color.green())
