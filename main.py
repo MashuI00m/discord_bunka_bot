@@ -5,6 +5,8 @@ from threading import Thread
 from flask import Flask
 import discord
 from discord.ext import commands
+import requests # HTTPリクエスト用
+import time     # 時間制御用
 
 # --- DB/SQLAlchemy 関連のインポート ---
 import datetime 
@@ -69,13 +71,41 @@ app = Flask(__name__)
 def home():
     return "Bot is alive!"
 
+# Bot自身のURLを取得するための環境変数
+BOT_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL") 
+PING_INTERVAL_SECONDS = 300 # 5分 (300秒) ごとにピンギング
+
+def ping_self():
+    """Botの外部URLに定期的にアクセスする関数"""
+    if not BOT_EXTERNAL_URL:
+        print("WARNING: RENDER_EXTERNAL_URL が設定されていないため、セルフピンギングをスキップします。")
+        return
+
+    while True:
+        try:
+            # Bot自身のWebサーバーにアクセス
+            response = requests.get(BOT_EXTERNAL_URL)
+            print(f"セルフピンギング実行: ステータスコード {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"セルフピンギング中にエラーが発生しました: {e}")
+        
+        # 5分間待機
+        time.sleep(PING_INTERVAL_SECONDS)
+
 def run_server():
     port = int(os.environ.get("PORT", 5000))
+    # Flask Webサーバーを起動
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    t = Thread(target=run_server)
-    t.start()
+    """Botの起動とは別に、Webサーバーとピンギングループを別スレッドで起動する"""
+    # 1. Webサーバー起動スレッド
+    server_thread = Thread(target=run_server)
+    server_thread.start()
+
+    # 2. セルフピンギングスレッド (新規追加)
+    ping_thread = Thread(target=ping_self)
+    ping_thread.start()
 # ----------------------------------------------------
 
 # --- Bot設定 ---
