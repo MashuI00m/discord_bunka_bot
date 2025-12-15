@@ -5,12 +5,9 @@ from threading import Thread
 from flask import Flask
 import discord
 from discord.ext import commands
-
-# --- 新規追加/修正インポート ---
 import requests # HTTPリクエスト用
 import time     # 時間制御用
-import asyncio  # Discordの wait_for 用
-# -----------------------------
+import asyncio
 
 # --- DB/SQLAlchemy 関連のインポート ---
 import datetime 
@@ -25,7 +22,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     print("WARNING: DATABASE_URL 環境変数が設定されていません。DB機能は無効です。", file=sys.stderr)
 
-# データベースエンジンの初期化
+# データベースエンジンの初期化 (Bot起動時に一度だけ実行される)
 engine = None
 Session = None
 Base = declarative_base()
@@ -68,21 +65,19 @@ class Attendance(Base):
     def __repr__(self):
         return f"<Attendance(user_id='{self.user_id}', org_name='{self.org_name}', is_proxy={self.is_proxy})>"
 
-# ----------------------------------------------------
-# ★★★ Keep Alive ロジックと Flask Webサーバーの設定 ★★★
-# ----------------------------------------------------
-
+# --- Flask Webサーバーの設定 ---
 app = Flask(__name__) 
-BOT_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL") 
-PING_INTERVAL_SECONDS = 300 # 5分 (300秒) ごとにピンギング
 
 @app.route('/')
 def home():
-    """Renderのヘルスチェック用エンドポイント"""
     return "Bot is alive!"
 
+# Bot自身のURLを取得するための環境変数
+BOT_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL") 
+PING_INTERVAL_SECONDS = 300 # 5分 (300秒) ごとにピンギング
+
 def ping_self():
-    """Botの外部URLに定期的にアクセスする関数 (セルフピンギング)"""
+    """Botの外部URLに定期的にアクセスする関数"""
     if not BOT_EXTERNAL_URL:
         print("WARNING: RENDER_EXTERNAL_URL が設定されていないため、セルフピンギングをスキップします。")
         return
@@ -104,12 +99,12 @@ def run_server():
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    """Webサーバーとピンギングループを別スレッドで起動する"""
+    """Botの起動とは別に、Webサーバーとピンギングループを別スレッドで起動する"""
     # 1. Webサーバー起動スレッド
     server_thread = Thread(target=run_server)
     server_thread.start()
 
-    # 2. セルフピンギングスレッド
+    # 2. セルフピンギングスレッド (新規追加)
     ping_thread = Thread(target=ping_self)
     ping_thread.start()
 # ----------------------------------------------------
@@ -129,7 +124,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # --- DB操作関数 ---
 
 def get_allowed_orgs_map():
-    """DBから許可された団体名マップ {ニックネームの団体名: ロール名} を取得する"""
+    """DBから許可された団体名マップ {ニックネームの団体名: ロール名} を取得する (修正)"""
     if not Session:
         return {}
     session = Session()
@@ -137,7 +132,9 @@ def get_allowed_orgs_map():
     try:
         orgs = session.query(OrgSettings.org_name, OrgSettings.alias).all()
         for org_name, alias in orgs:
+            # 本名をマップに追加 {本名: 本名}
             org_map[org_name.lower()] = org_name 
+            # 略称があればマップに追加 {略称: 本名}
             if alias:
                 org_map[alias.lower()] = org_name
         return org_map
@@ -148,7 +145,6 @@ def get_allowed_orgs_map():
         session.close()
 
 def record_attendance(user_id: str, org_name: str, is_proxy: bool):
-    """出席記録をDBに保存する"""
     if not Session:
         return False
     session = Session()
@@ -170,7 +166,7 @@ def record_attendance(user_id: str, org_name: str, is_proxy: bool):
 
 def delete_attendance_records(user_id_to_delete=None, is_proxy_status=None):
     """
-    指定された条件に一致する Attendance レコードをDBから削除する関数 (新規追加)
+    指定された条件に一致する Attendance レコードをDBから削除する関数
     """
     if not Session:
         return 0 
@@ -240,7 +236,7 @@ async def ensure_org_channel(guild, role, org_name):
             pass 
 
 # ---------------------------------------------------------
-# ボタンの定義
+# ボタンの定義 (既存のロールチェック View)
 # ---------------------------------------------------------
 class RoleCheckView(discord.ui.View):
     def __init__(self):
@@ -514,7 +510,6 @@ async def on_ready():
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def bulk_proxy_checkin(ctx):
-    # (省略: 処理内容は変更なし)
     guild = ctx.guild
     org_map = get_allowed_orgs_map()
     proxy_role = await get_or_create_proxy_role(guild)
@@ -555,14 +550,17 @@ async def bulk_proxy_checkin(ctx):
                 
                 # 1. 団体ロールの付与/剥奪
                 if is_proxy_in_name:
+                    # 代理の場合: 団体ロールを剥奪 (持っていたら)
                     if org_role in member.roles:
                         try: await member.remove_roles(org_role)
                         except discord.Forbidden: pass
                 else:
+                    # 通常の場合: 団体ロールを付与
                     if org_role not in member.roles:
                         try: await member.add_roles(org_role)
                         except discord.Forbidden: pass
 
+                    # 他の団体ロールの剥奪
                     for user_role in member.roles:
                         if user_role.name in all_org_names and user_role.name != role_org_name:
                             try: await member.remove_roles(user_role)
@@ -602,51 +600,6 @@ async def bulk_proxy_checkin(ctx):
     if log_channel:
         await log_channel.send(report_message)
 
-
-@bot.command()
-async def panel(ctx):
-    embed = discord.Embed(
-        title="所属確認・ロール付与",
-        description="下のボタンを押すと、名前に応じたロールと個室を自動で用意します。\n**名前に「代理」が含まれている場合、団体ロールは付与されません。**",
-        color=discord.Color.blue()
-    )
-    await ctx.send(embed=embed, view=RoleCheckView())
-
-@bot.command()
-async def attend_panel(ctx):
-    embed = discord.Embed(
-        title="📝 出席確認パネル",
-        description="ご自身の参加区分に合わせたボタンを押して、出席を記録してください。\n**最初に `!panel` で団体ロールが付与されている必要があります。**",
-        color=discord.Color.orange()
-    )
-    await ctx.send(embed=embed, view=AttendanceView())
-
-@bot.command()
-async def add_org(ctx, org_name: str, alias: str = None):
-    """団体名（ロール名）と必要に応じて略称をDBに追加する"""
-    if not Session:
-        await ctx.send('❌ データベース接続が確立されていません。')
-        return
-        
-    session = Session()
-    try:
-        if session.query(OrgSettings).filter_by(org_name=org_name).first():
-            await ctx.send(f'⚠️ 団体名「{org_name}」は既に登録されています。')
-        elif alias and session.query(OrgSettings).filter_by(alias=alias).first():
-             await ctx.send(f'⚠️ 略称「{alias}」は既に他の団体で使用されています。')
-        else:
-            new_org = OrgSettings(org_name=org_name, alias=alias)
-            session.add(new_org)
-            session.commit()
-            msg = f'✅ 団体名リスト（DB）に「{org_name}」を追加しました。'
-            if alias:
-                msg += f' (略称: {alias})'
-            await ctx.send(msg)
-    except Exception as e:
-        session.rollback()
-        await ctx.send(f'❌ DBへの書き込みに失敗しました: {e}')
-    finally:
-        session.close()
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -703,8 +656,52 @@ async def delete_attendance(ctx, target: discord.Member = None, proxy_status: st
 
 
 @bot.command()
+async def panel(ctx):
+    embed = discord.Embed(
+        title="所属確認・ロール付与",
+        description="下のボタンを押すと、名前に応じたロールと個室を自動で用意します。\n**名前に「代理」が含まれている場合、団体ロールは付与されません。**",
+        color=discord.Color.blue()
+    )
+    await ctx.send(embed=embed, view=RoleCheckView())
+
+@bot.command()
+async def attend_panel(ctx):
+    embed = discord.Embed(
+        title="📝 出席確認パネル",
+        description="ご自身の参加区分に合わせたボタンを押して、出席を記録してください。\n**最初に `!panel` で団体ロールが付与されている必要があります。**",
+        color=discord.Color.orange()
+    )
+    await ctx.send(embed=embed, view=AttendanceView())
+
+@bot.command()
+async def add_org(ctx, org_name: str, alias: str = None):
+    """団体名（ロール名）と必要に応じて略称をDBに追加する (修正)"""
+    if not Session:
+        await ctx.send('❌ データベース接続が確立されていません。')
+        return
+        
+    session = Session()
+    try:
+        if session.query(OrgSettings).filter_by(org_name=org_name).first():
+            await ctx.send(f'⚠️ 団体名「{org_name}」は既に登録されています。')
+        elif alias and session.query(OrgSettings).filter_by(alias=alias).first():
+             await ctx.send(f'⚠️ 略称「{alias}」は既に他の団体で使用されています。')
+        else:
+            new_org = OrgSettings(org_name=org_name, alias=alias)
+            session.add(new_org)
+            session.commit()
+            msg = f'✅ 団体名リスト（DB）に「{org_name}」を追加しました。'
+            if alias:
+                msg += f' (略称: {alias})'
+            await ctx.send(msg)
+    except Exception as e:
+        session.rollback()
+        await ctx.send(f'❌ DBへの書き込みに失敗しました: {e}')
+    finally:
+        session.close()
+
+@bot.command()
 async def list_orgs(ctx):
-    # (省略: 処理内容は変更なし)
     org_map = get_allowed_orgs_map()
     if org_map:
         output = '📋 **登録済み団体名 (本名 / 略称):**\n'
