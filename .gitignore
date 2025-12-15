@@ -1,0 +1,11 @@
+# 依存関係
+__pycache__/
+*.pyc
+venv/
+
+# 秘密情報
+.env 
+
+
+# OSファイル
+.DS_Store
