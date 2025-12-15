@@ -2,3 +2,4 @@ discord.py
 Flask
 sqlalchemy
 requests 
+psycopg2-binary
