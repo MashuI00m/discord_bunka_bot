@@ -1,6 +1,7 @@
 import os
 import sys
 import re 
+from threading import Thread # スレッド処理を再導入
 from flask import Flask
 import discord
 from discord.ext import commands
@@ -24,13 +25,11 @@ Base = declarative_base()
 
 if DATABASE_URL:
     try:
-        # DB接続を試行
         engine = create_engine(DATABASE_URL)
         Session = sessionmaker(bind=engine)
         print("データベース接続エンジンを初期化しました。")
     except Exception as e:
         print(f"FATAL ERROR: DB接続エンジンの初期化に失敗しました: {e}", file=sys.stderr)
-        # 接続エラーでもBotは続行できるようにするため、ここではプログラムを終了しない
 
 # --- DBテーブル定義 ---
 class OrgSettings(Base):
@@ -44,13 +43,29 @@ class OrgSettings(Base):
         return f"<OrgSettings(org_name='{self.org_name}')>"
 
 # --- Flask Webサーバーの設定 ---
-# gunicorn main:app のターゲットとなるFlaskインスタンス
 app = Flask(__name__) 
 
 # ルートURL（"/"）にアクセスがあったときに実行される関数 (Renderのヘルスチェック用)
 @app.route('/')
 def home():
     return "Bot is alive!"
+
+# --- ポートバインドのためのWebサーバー起動関数を復元 ---
+def run_server():
+    # Renderが環境変数 'PORT' で指定するポートを使用する
+    port = int(os.environ.get("PORT", 5000))
+    # Flaskアプリを別スレッドで起動する
+    # host='0.0.0.0' は外部からのアクセスを許可するために必須
+    # gunicornを使う場合、この行は競合を避けるためにコメントアウトまたは削除が推奨されますが、
+    # 確実なポートバインドのため、ここでは実行します。
+    # ただし、Start Commandを `gunicorn main:app` から `python main.py` に変える必要があります。
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    """Botの起動とは別に、Webサーバーを別スレッドで起動する"""
+    t = Thread(target=run_server)
+    t.start()
+# ----------------------------------------------------
 
 # --- Bot設定 ---
 LOG_CHANNEL_NAME = '管理ログ'
@@ -74,11 +89,9 @@ def get_allowed_orgs():
         return set()
     session = Session()
     try:
-        # DBに保存されているすべての団体名を取得し、セットに変換
         orgs = session.query(OrgSettings.org_name).all()
         return set(o[0] for o in orgs)
     except OperationalError as e:
-        # テーブルが存在しない、または接続エラーの場合
         print(f"DB Operational Error: {e}")
         return set()
     except SQLAlchemyError as e:
@@ -88,7 +101,7 @@ def get_allowed_orgs():
         session.close()
 
 # ---------------------------------------------------------
-# ボタンの定義 (View)
+# ボタンの定義 (View) (変更なし)
 # ---------------------------------------------------------
 class RoleCheckView(discord.ui.View):
     def __init__(self):
@@ -102,14 +115,11 @@ class RoleCheckView(discord.ui.View):
         guild = interaction.guild
         display_name = user.display_name
         
-        # 実行時に最新の団体名リストをDBから取得
         allowed_orgs = get_allowed_orgs()
         
-        # 結果メッセージ用変数
         result_msg = ""
         is_success = False
 
-        # --- ロジック ---
         match = re.search(r'[@＠](.+)$', display_name)
         
         if not match:
@@ -120,7 +130,6 @@ class RoleCheckView(discord.ui.View):
             if org_name not in allowed_orgs:
                 result_msg = f'🚫 団体名「{org_name}」は登録されていません。管理者に連絡してください。'
             else:
-                # 1. ロール処理
                 role = discord.utils.get(guild.roles, name=org_name)
                 created_new_role = False
 
@@ -132,7 +141,6 @@ class RoleCheckView(discord.ui.View):
                     except discord.Forbidden:
                         result_msg = '❌ エラー: Botにロールを作成する権限がありません。'
                         
-                # 2. 付与処理（ロールが存在する場合のみ進む）
                 if role:
                     if role not in user.roles:
                         try:
@@ -147,10 +155,8 @@ class RoleCheckView(discord.ui.View):
                         result_msg = f'✅ 既にロール「{role.name}」を持っています。'
                         is_success = True
 
-        # --- 1. ユーザーへの返信 (自分だけ見える) ---
         await interaction.followup.send(result_msg, ephemeral=True)
 
-        # --- 2. 管理者への報告 (指定チャンネルに書き込む) ---
         if is_success: 
             log_channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
             if log_channel:
@@ -177,12 +183,11 @@ async def ensure_org_channel(guild, role, org_name):
         except:
             pass 
 
-# --- Bot起動・コマンド ---
+# --- Bot起動・コマンド (変更なし) ---
 
 @bot.event
 async def on_ready():
     if engine:
-        # データベースにテーブルが存在しない場合、ここで作成
         Base.metadata.create_all(engine)
         print("DBテーブル構造を確認・作成しました。")
     
@@ -207,7 +212,6 @@ async def add_org(ctx, org_name: str):
         
     session = Session()
     try:
-        # DBに新しい団体名を追加
         if session.query(OrgSettings).filter_by(org_name=org_name).first():
             await ctx.send(f'⚠️ 団体名「{org_name}」は既に登録されています。')
         else:
@@ -231,15 +235,11 @@ async def list_orgs(ctx):
 
 # --- 最終起動処理 ---
 
-# Webサーバー（Flask/gunicorn）とBot（Discord）の同時起動には
-# discord.pyの内部ループ機能を使うため、ここでは何も実行しない。
-# gunicornがBotのコードを実行し、Webサーバー(app)を起動する。
+keep_alive() # Webサーバーを別スレッドで起動！
 
 if DISCORD_TOKEN:
     try:
-        # gunicornが起動処理を行うため、この bot.run() が実行されるかどうかは
-        # Renderの環境設定に依存するが、安全のため残す。
-        # Botをメインで動かし、Webサーバーをサブで動かす一般的な構造。
+        # Bot本体をメインスレッドで起動
         bot.run(DISCORD_TOKEN)
     except discord.errors.LoginFailure:
         print("FATAL ERROR: 無効なトークンが設定されています。", file=sys.stderr)
