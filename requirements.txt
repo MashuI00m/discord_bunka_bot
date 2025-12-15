@@ -1,16 +1,4 @@
-# Discord Botの核となるライブラリ
 discord.py
-
-# Webサーバー機能（Renderのスリープ回避用）
 Flask
-gunicorn
-
-# (もしBotが他のライブラリを使用している場合はここに追加してください)
-# 例: requests, pillow, numpy など
-
-# PostgreSQLに接続するためのライブラリ
-psycopg2-binary 
-# DB操作を簡単にするORM（推奨）
-SQLAlchemy
-
-requests
+sqlalchemy
+requests 

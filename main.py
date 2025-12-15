@@ -5,8 +5,12 @@ from threading import Thread
 from flask import Flask
 import discord
 from discord.ext import commands
+
+# --- 新規追加/修正インポート ---
 import requests # HTTPリクエスト用
 import time     # 時間制御用
+import asyncio  # Discordの wait_for 用
+# -----------------------------
 
 # --- DB/SQLAlchemy 関連のインポート ---
 import datetime 
@@ -21,7 +25,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     print("WARNING: DATABASE_URL 環境変数が設定されていません。DB機能は無効です。", file=sys.stderr)
 
-# データベースエンジンの初期化 (Bot起動時に一度だけ実行される)
+# データベースエンジンの初期化
 engine = None
 Session = None
 Base = declarative_base()
@@ -64,19 +68,21 @@ class Attendance(Base):
     def __repr__(self):
         return f"<Attendance(user_id='{self.user_id}', org_name='{self.org_name}', is_proxy={self.is_proxy})>"
 
-# --- Flask Webサーバーの設定 ---
+# ----------------------------------------------------
+# ★★★ Keep Alive ロジックと Flask Webサーバーの設定 ★★★
+# ----------------------------------------------------
+
 app = Flask(__name__) 
-
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-# Bot自身のURLを取得するための環境変数
 BOT_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL") 
 PING_INTERVAL_SECONDS = 300 # 5分 (300秒) ごとにピンギング
 
+@app.route('/')
+def home():
+    """Renderのヘルスチェック用エンドポイント"""
+    return "Bot is alive!"
+
 def ping_self():
-    """Botの外部URLに定期的にアクセスする関数"""
+    """Botの外部URLに定期的にアクセスする関数 (セルフピンギング)"""
     if not BOT_EXTERNAL_URL:
         print("WARNING: RENDER_EXTERNAL_URL が設定されていないため、セルフピンギングをスキップします。")
         return
@@ -98,12 +104,12 @@ def run_server():
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    """Botの起動とは別に、Webサーバーとピンギングループを別スレッドで起動する"""
+    """Webサーバーとピンギングループを別スレッドで起動する"""
     # 1. Webサーバー起動スレッド
     server_thread = Thread(target=run_server)
     server_thread.start()
 
-    # 2. セルフピンギングスレッド (新規追加)
+    # 2. セルフピンギングスレッド
     ping_thread = Thread(target=ping_self)
     ping_thread.start()
 # ----------------------------------------------------
@@ -123,7 +129,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # --- DB操作関数 ---
 
 def get_allowed_orgs_map():
-    """DBから許可された団体名マップ {ニックネームの団体名: ロール名} を取得する (修正)"""
+    """DBから許可された団体名マップ {ニックネームの団体名: ロール名} を取得する"""
     if not Session:
         return {}
     session = Session()
@@ -131,9 +137,7 @@ def get_allowed_orgs_map():
     try:
         orgs = session.query(OrgSettings.org_name, OrgSettings.alias).all()
         for org_name, alias in orgs:
-            # 本名をマップに追加 {本名: 本名}
             org_map[org_name.lower()] = org_name 
-            # 略称があればマップに追加 {略称: 本名}
             if alias:
                 org_map[alias.lower()] = org_name
         return org_map
@@ -144,6 +148,7 @@ def get_allowed_orgs_map():
         session.close()
 
 def record_attendance(user_id: str, org_name: str, is_proxy: bool):
+    """出席記録をDBに保存する"""
     if not Session:
         return False
     session = Session()
@@ -160,6 +165,42 @@ def record_attendance(user_id: str, org_name: str, is_proxy: bool):
         session.rollback()
         print(f"DB Error during attendance recording: {e}")
         return False
+    finally:
+        session.close()
+
+def delete_attendance_records(user_id_to_delete=None, is_proxy_status=None):
+    """
+    指定された条件に一致する Attendance レコードをDBから削除する関数 (新規追加)
+    """
+    if not Session:
+        return 0 
+    
+    session = Session()
+    deleted_count = 0
+    
+    try:
+        query = session.query(Attendance)
+        
+        # 削除条件の組み立て
+        if user_id_to_delete:
+            query = query.filter(Attendance.user_id == user_id_to_delete)
+        
+        if is_proxy_status is not None:
+            query = query.filter(Attendance.is_proxy == is_proxy_status)
+            
+        # 削除実行 (条件がない場合は、コマンド実行側で制御するため、ここでは実行しない)
+        if user_id_to_delete or is_proxy_status is not None:
+            deleted_count = query.delete(synchronize_session=False)
+            session.commit()
+            return deleted_count
+        else:
+             return 0
+        
+    except Exception as e:
+        session.rollback()
+        print(f"DB DELETE Error: {e}")
+        return -1 
+        
     finally:
         session.close()
 
@@ -199,7 +240,7 @@ async def ensure_org_channel(guild, role, org_name):
             pass 
 
 # ---------------------------------------------------------
-# ボタンの定義 (既存のロールチェック View)
+# ボタンの定義
 # ---------------------------------------------------------
 class RoleCheckView(discord.ui.View):
     def __init__(self):
@@ -213,7 +254,7 @@ class RoleCheckView(discord.ui.View):
         guild = interaction.guild
         display_name = user.display_name
         
-        org_map = get_allowed_orgs_map() # マップを取得 (修正)
+        org_map = get_allowed_orgs_map() 
         proxy_role = await get_or_create_proxy_role(guild)
         
         # 1. ニックネームの代理フラグと団体名抽出
@@ -334,7 +375,7 @@ class RoleCheckView(discord.ui.View):
                 await log_channel.send(embed=embed)
 
 # ---------------------------------------------------------
-# 出席確認のための新しい View (団体名の取得ロジックのみ修正)
+# 出席確認のための新しい View
 # ---------------------------------------------------------
 class AttendanceView(discord.ui.View):
     def __init__(self):
@@ -346,7 +387,7 @@ class AttendanceView(discord.ui.View):
         user = interaction.user
         guild = interaction.guild
         display_name = user.display_name
-        org_map = get_allowed_orgs_map() # マップを取得 (修正)
+        org_map = get_allowed_orgs_map() 
         
         # ニックネームから団体名を抽出
         cleaned_name = re.sub(r'(代理|だいり)', '', display_name, flags=re.IGNORECASE).strip()
@@ -362,12 +403,6 @@ class AttendanceView(discord.ui.View):
         if not role_org_name:
             return await interaction.followup.send(f'🚫 団体名「{nickname_org_key}」は登録されていません。管理者に連絡してください。', ephemeral=True)
 
-        # 団体ロールの確認 (出席には必須)
-        org_role = discord.utils.get(guild.roles, name=role_org_name)
-        if org_role is None or org_role not in user.roles:
-            # 団体ロールがない場合（代理参加者は団体ロールを持たないため）
-            # ただし、代理参加者は通常 !panel の後にこちらに来るため、ここでは警告のみに留める
-            pass 
         
         proxy_role = await get_or_create_proxy_role(guild)
         
@@ -479,6 +514,7 @@ async def on_ready():
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def bulk_proxy_checkin(ctx):
+    # (省略: 処理内容は変更なし)
     guild = ctx.guild
     org_map = get_allowed_orgs_map()
     proxy_role = await get_or_create_proxy_role(guild)
@@ -519,17 +555,14 @@ async def bulk_proxy_checkin(ctx):
                 
                 # 1. 団体ロールの付与/剥奪
                 if is_proxy_in_name:
-                    # 代理の場合: 団体ロールを剥奪 (持っていたら)
                     if org_role in member.roles:
                         try: await member.remove_roles(org_role)
                         except discord.Forbidden: pass
                 else:
-                    # 通常の場合: 団体ロールを付与
                     if org_role not in member.roles:
                         try: await member.add_roles(org_role)
                         except discord.Forbidden: pass
 
-                    # 他の団体ロールの剥奪
                     for user_role in member.roles:
                         if user_role.name in all_org_names and user_role.name != role_org_name:
                             try: await member.remove_roles(user_role)
@@ -590,7 +623,7 @@ async def attend_panel(ctx):
 
 @bot.command()
 async def add_org(ctx, org_name: str, alias: str = None):
-    """団体名（ロール名）と必要に応じて略称をDBに追加する (修正)"""
+    """団体名（ロール名）と必要に応じて略称をDBに追加する"""
     if not Session:
         await ctx.send('❌ データベース接続が確立されていません。')
         return
@@ -616,7 +649,62 @@ async def add_org(ctx, org_name: str, alias: str = None):
         session.close()
 
 @bot.command()
+@commands.has_permissions(administrator=True)
+async def delete_attendance(ctx, target: discord.Member = None, proxy_status: str = None):
+    """
+    Attendance (出席記録) テーブルからレコードを削除する。
+    - target: 削除したいユーザー (@ユーザー名)
+    - proxy_status: 削除したいステータス ('proxy' または 'regular')
+    例: !delete_attendance @User proxy (指定ユーザーの代理記録を削除)
+    例: !delete_attendance proxy (全ユーザーの代理記録を削除)
+    """
+    if not Session:
+        return await ctx.send('❌ データベース接続が確立されていません。')
+
+    await ctx.defer()
+    user_id = str(target.id) if target else None
+    
+    is_proxy_delete = None
+    if proxy_status and proxy_status.lower() in ('proxy', '代理'):
+        is_proxy_delete = True
+    elif proxy_status and proxy_status.lower() in ('regular', '通常'):
+        is_proxy_delete = False
+    elif proxy_status:
+        return await ctx.send("❌ `proxy_status`は 'proxy' または 'regular' のみを指定してください。")
+
+    # 削除条件が一つも指定されていない場合はエラー
+    if not user_id and is_proxy_delete is None:
+        return await ctx.send("❌ **削除を実行するには、対象ユーザー (@ユーザー名) または削除したいステータス ('proxy'/'regular') の少なくとも一方を指定してください。**")
+
+    # ユーザー指定がない（全ユーザー対象）場合のみ確認を求める
+    if not target:
+        status_text = f"**{'代理' if is_proxy_delete else '通常'}**の出席記録" if is_proxy_delete is not None else "全ての出席記録"
+        await ctx.send(f"⚠️ **警告**: 対象ユーザーが指定されていません。全ユーザーの{status_text}が対象になります。続行しますか？ (`yes` / `no`)")
+        
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ('yes', 'no')
+            
+        try:
+            msg = await bot.wait_for('message', check=check, timeout=30.0)
+            if msg.content.lower() == 'no':
+                return await ctx.send("操作をキャンセルしました。")
+        except asyncio.TimeoutError:
+            return await ctx.send("タイムアウトしました。操作をキャンセルします。")
+    
+    # 削除実行
+    deleted_count = delete_attendance_records(user_id, is_proxy_delete)
+    
+    if deleted_count > 0:
+        await ctx.send(f"✅ DBから**{deleted_count}件**の出席記録を削除しました。")
+    elif deleted_count == 0:
+        await ctx.send("ℹ️ 削除条件に一致するレコードは見つかりませんでした。")
+    else:
+        await ctx.send("❌ DBの削除中にエラーが発生しました。ログを確認してください。")
+
+
+@bot.command()
 async def list_orgs(ctx):
+    # (省略: 処理内容は変更なし)
     org_map = get_allowed_orgs_map()
     if org_map:
         output = '📋 **登録済み団体名 (本名 / 略称):**\n'
