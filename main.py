@@ -244,7 +244,6 @@ async def list_orgs(ctx):
         await ctx.send('現在登録されている団体名はありません。（またはDB接続エラー）')
 
 # --- 最終起動処理 ---
-keep_alive()
 
 # トークン取得は既に上のほうで行われているため、ここではBotの実行のみ
 if DISCORD_TOKEN:
