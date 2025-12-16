@@ -730,6 +730,30 @@ async def add_org(ctx, org_name: str, alias: str = None):
     finally:
         session.close()
 
+@bot.command(name='delete_org')
+@commands.has_permissions(administrator=True)
+async def delete_org(ctx, org_identifier: str):
+    """
+    団体名（ロール名）または略称を指定して、OrgSettingsから団体設定を削除します。
+    """
+    
+    # データベースから団体情報を取得・削除する関数を呼び出す
+    success = delete_org_setting(org_identifier) # この関数は別途定義が必要です
+
+    if success:
+        await ctx.send(f"✅ 団体設定 **{org_identifier}** の削除が完了しました。")
+    else:
+        await ctx.send(f"❌ 団体設定 **{org_identifier}** は見つかりませんでした。本名または略称を確認してください。")
+
+@delete_org.error
+async def delete_org_error(ctx, error):
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("❌ 削除したい団体名（本名または略称）を指定してください。例: `!delete_org テニス部`")
+    elif isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ このコマンドを実行するには管理者権限が必要です。")
+    else:
+        print(f"delete_orgコマンドで予期せぬエラー: {error}")
+
 @bot.command()
 async def list_orgs(ctx):
     org_map = get_allowed_orgs_map()
