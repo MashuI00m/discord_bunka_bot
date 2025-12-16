@@ -730,27 +730,45 @@ async def add_org(ctx, org_name: str, alias: str = None):
     finally:
         session.close()
 
-@bot.command(name='delete_org')
+@bot.command()
 @commands.has_permissions(administrator=True)
 async def delete_org(ctx, org_identifier: str):
     """
     団体名（ロール名）または略称を指定して、OrgSettingsから団体設定を削除します。
     """
-    
-    # データベースから団体情報を取得・削除する関数を呼び出す
-    success = delete_org_setting(org_identifier) # この関数は別途定義が必要です
+    if not Session:
+        return await ctx.send('❌ データベース接続が確立されていません。')
 
-    if success:
-        await ctx.send(f"✅ 団体設定 **{org_identifier}** の削除が完了しました。")
-    else:
-        await ctx.send(f"❌ 団体設定 **{org_identifier}** は見つかりませんでした。本名または略称を確認してください。")
+    session = Session()
+    try:
+        # 本名（org_name）または略称（alias）でレコードを検索
+        # ※ aliasは、OrgSettingsクラスで定義されているカラム名です。
+        org = session.query(OrgSettings).filter(
+            (OrgSettings.org_name == org_identifier) | (OrgSettings.alias == org_identifier)
+        ).first()
+        
+        if org:
+            # レコードが見つかった場合、削除を実行
+            session.delete(org)
+            session.commit()
+            await ctx.send(f"✅ 団体設定 **{org_identifier}**（本名: {org.org_name}）の削除が完了しました。")
+        else:
+            await ctx.send(f"❌ 団体設定 **{org_identifier}** は見つかりませんでした。本名または略称を確認してください。")
+            
+    except Exception as e:
+        session.rollback()
+        await ctx.send(f"❌ DBでの削除中にエラーが発生しました: {e}")
+        print(f"団体設定の削除中にエラーが発生しました: {e}")
+    finally:
+        session.close()
 
 @delete_org.error
 async def delete_org_error(ctx, error):
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("❌ 削除したい団体名（本名または略称）を指定してください。例: `!delete_org テニス部`")
     elif isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ このコマンドを実行するには管理者権限が必要です。")
+        # 権限エラーの場合、ここではエラーメッセージを送信しない（デフォルト動作を利用）
+        pass
     else:
         print(f"delete_orgコマンドで予期せぬエラー: {error}")
 
