@@ -726,12 +726,15 @@ async def list_orgs(ctx):
 
 # --- 最終起動処理 ---
 
-keep_alive() 
-
-if DISCORD_TOKEN:
-    try:
-        bot.run(DISCORD_TOKEN)
-    except discord.errors.LoginFailure:
-        print("FATAL ERROR: 無効なトークンが設定されています。", file=sys.stderr)
-    except Exception as e:
-        print(f"FATAL ERROR: 予期せぬエラーが発生しました: {e}", file=sys.stderr)
+if __name__ == "__main__":
+    if DISCORD_TOKEN:
+        # 1. Keep Alive (Flaskサーバーとピンギング) を別スレッドで起動
+        keep_alive() 
+        
+        # 2. メインスレッドでDiscord Botクライアントを実行
+        try:
+            bot.run(DISCORD_TOKEN)
+        except discord.errors.LoginFailure:
+            print("FATAL ERROR: 無効なトークンが設定されています。", file=sys.stderr)
+        except Exception as e:
+            print(f"FATAL ERROR: 予期せぬエラーが発生しました: {e}", file=sys.stderr)
