@@ -468,39 +468,69 @@ async def on_ready():
     for guild in bot.guilds:
         proxy_role = await get_or_create_proxy_role(guild)
 
-        # 共有チャンネル権限設定ロジック
+       # 共有チャンネル権限設定ロジック (変更なし)
         shared_overwrite = discord.PermissionOverwrite(
-            read_messages=True, 
-            send_messages=True, 
-            connect=True,      
-            speak=True          
+        read_messages=True, 
+        send_messages=True, 
+        connect=True,      
+        speak=True          
         )
 
-        for category in guild.categories:
-            if category.name == SHARED_CATEGORY_NAME:
-                print(f"会議室カテゴリ ({category.name}) の権限を設定中...")
-                
-                try:
-                    await category.set_permissions(guild.default_role, overwrite=shared_overwrite)
-                    
-                    if proxy_role:
-                        await category.set_permissions(proxy_role, overwrite=shared_overwrite)
-                        print(" - 代理ロールにアクセスを明示的に許可しました。")
+        # DBから登録されている全ての団体名を取得
+            
+        org_map = get_allowed_orgs_map()
+        all_org_names = set(org_map.values()) # 本名のロール名リスト
 
-                    print(" - カテゴリ全体の設定完了")
+        for guild in bot.guilds:
+            proxy_role = await get_or_create_proxy_role(guild)
+
+        for category in guild.categories:
+            if category.name == SHARED_CATEGORY_NAME: # '会議室' カテゴリ
+                print(f"会議室カテゴリ ({category.name}) の権限を設定中...")
+            
+             # 1. @everyone のアクセスを無効化 (セキュリティのため)
+                try:
+                 await category.set_permissions(guild.default_role, overwrite=discord.PermissionOverwrite(read_messages=False))
                 except discord.Forbidden:
                     print(" - ❌ 権限不足によりカテゴリの権限設定ができませんでした。")
                     continue
-                    
-                for channel in category.channels:
+
+                # 2. 代理ロールにアクセスを許可
+                if proxy_role:
                     try:
-                        await channel.set_permissions(guild.default_role, overwrite=shared_overwrite)
-                        if proxy_role:
-                            await channel.set_permissions(proxy_role, overwrite=shared_overwrite)
-                            
-                        print(f" - チャンネル {channel.name} の設定完了")
+                        await category.set_permissions(proxy_role, overwrite=shared_overwrite)
+                        print(" - 代理ロールにアクセスを明示的に許可しました。")
                     except discord.Forbidden:
-                        print(f" - ❌ 権限不足によりチャンネル {channel.name} の権限設定ができませんでした。")
+                        pass
+
+                # 3. 団体ロールにアクセスを許可 (ここが新しいロジック)
+                for org_name in all_org_names:
+                    org_role = discord.utils.get(guild.roles, name=org_name)
+                    if org_role:
+                        try:
+                            await category.set_permissions(org_role, overwrite=shared_overwrite)
+                            print(f" - 団体ロール {org_name} にアクセスを許可しました。")
+                        except discord.Forbidden:
+                            print(f" - ❌ 団体ロール {org_name} の権限設定に失敗しました。")
+
+
+                print(" - カテゴリ全体の設定完了")
+                
+                # 4. カテゴリ内のチャンネル権限も同様に設定 (これは既存のロジックを再利用)
+                for channel in category.channels:
+                    # チャンネルレベルでも @everyone を無効化
+                    await channel.set_permissions(guild.default_role, overwrite=discord.PermissionOverwrite(read_messages=False))
+                    
+                    # 代理ロールにアクセスを許可
+                    if proxy_role:
+                        await channel.set_permissions(proxy_role, overwrite=shared_overwrite)
+                    
+                    # 団体ロールにアクセスを許可
+                    for org_name in all_org_names:
+                        org_role = discord.utils.get(guild.roles, name=org_name)
+                        if org_role:
+                            await channel.set_permissions(org_role, overwrite=shared_overwrite)
+
         
     bot.add_view(RoleCheckView())
     bot.add_view(AttendanceView())
