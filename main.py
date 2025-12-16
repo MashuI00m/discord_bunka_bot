@@ -5,65 +5,52 @@ from threading import Thread
 from flask import Flask
 import discord
 from discord.ext import commands
-import requests # HTTPリクエスト用
-import time     # 時間制御用
+import requests
+import time
 import asyncio
+import datetime
+import csv # CSVファイル操作のために追加
 
-# --- DB/SQLAlchemy 関連のインポート ---
-import datetime 
-from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.exc import OperationalError, SQLAlchemyError 
-# ------------------------------------
+# --- CSVファイル設定 ---
+# データベースの代わりにローカルのCSVファイルを使用します
+ORG_FILE = 'organizations.csv'
+ATTENDANCE_FILE = 'attendance.csv'
 
-# --- DB接続設定 ---
-DATABASE_URL = os.environ.get("DATABASE_URL")
-if not DATABASE_URL:
-    print("WARNING: DATABASE_URL 環境変数が設定されていません。DB機能は無効です。", file=sys.stderr)
+ORG_HEADERS = ['org_name', 'alias']  # 団体設定のカラム
+ATTENDANCE_HEADERS = ['user_id', 'org_name', 'is_proxy', 'timestamp'] # 出席記録のカラム
 
-# データベースエンジンの初期化 (Bot起動時に一度だけ実行される)
-engine = None
-Session = None
-Base = declarative_base()
+def ensure_csv_file(filename, headers):
+    """ファイルが存在しない場合、ヘッダーを作成してファイルを初期化する"""
+    if not os.path.exists(filename):
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
 
-if DATABASE_URL:
-    try:
-        engine = create_engine(DATABASE_URL)
-        Session = sessionmaker(bind=engine)
-        print("データベース接続エンジンを初期化しました。")
-    except Exception as e:
-        print(f"FATAL ERROR: DB接続エンジンの初期化に失敗しました: {e}", file=sys.stderr)
+# CSVファイルを初期化
+ensure_csv_file(ORG_FILE, ORG_HEADERS)
+ensure_csv_file(ATTENDANCE_FILE, ATTENDANCE_HEADERS)
+
+# --- CSV読み書きユーティリティ ---
+
+def load_data(filename):
+    """CSVから全てのデータをリストとして読み込む"""
+    if not os.path.exists(filename):
+        return []
+    with open(filename, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
+def save_data(filename, headers, data):
+    """データをCSVファイルに書き込む"""
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(data)
 
 # --- 定数 ---
 LOG_CHANNEL_NAME = '管理ログ'
 PROXY_ROLE_NAME = 'Proxy Attendee' 
 SHARED_CATEGORY_NAME = '会議室'
-
-# --- DBテーブル定義 ---
-class OrgSettings(Base):
-    """許可された団体名を保存するテーブル (略称カラムを追加)"""
-    __tablename__ = 'allowed_organizations'
-    
-    id = Column(Integer, primary_key=True)
-    org_name = Column(String, unique=True, nullable=False) # 本名 (ロール名)
-    alias = Column(String, unique=True, nullable=True)     # 略称 (ニックネーム対応用)
-
-    def __repr__(self):
-        return f"<OrgSettings(org_name='{self.org_name}', alias='{self.alias}')>"
-
-class Attendance(Base):
-    """出席記録を保存するテーブル"""
-    __tablename__ = 'attendance_records'
-    
-    id = Column(Integer, primary_key=True)
-    user_id = Column(String, nullable=False)
-    org_name = Column(String, nullable=False)
-    is_proxy = Column(Boolean, default=False)
-    timestamp = Column(DateTime, default=datetime.datetime.utcnow) 
-
-    def __repr__(self):
-        return f"<Attendance(user_id='{self.user_id}', org_name='{self.org_name}', is_proxy={self.is_proxy})>"
 
 # --- Flask Webサーバーの設定 ---
 app = Flask(__name__) 
@@ -104,7 +91,7 @@ def keep_alive():
     server_thread = Thread(target=run_server)
     server_thread.start()
 
-    # 2. セルフピンギングスレッド (新規追加)
+    # 2. セルフピンギングスレッド
     ping_thread = Thread(target=ping_self)
     ping_thread.start()
 # ----------------------------------------------------
@@ -121,84 +108,72 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# --- DB操作関数 ---
+# --- CSV操作関数 ---
 
 def get_allowed_orgs_map():
-    """DBから許可された団体名マップ {ニックネームの団体名: ロール名} を取得する (修正)"""
-    if not Session:
-        return {}
-    session = Session()
+    """CSVから許可された団体名マップ {ニックネームの団体名: ロール名} を取得する"""
+    orgs_data = load_data(ORG_FILE)
     org_map = {}
-    try:
-        orgs = session.query(OrgSettings.org_name, OrgSettings.alias).all()
-        for org_name, alias in orgs:
-            # 本名をマップに追加 {本名: 本名}
+    
+    for row in orgs_data:
+        org_name = row.get('org_name')
+        alias = row.get('alias')
+        
+        if org_name:
+            # 本名をマップに追加 {本名(小文字): 本名}
             org_map[org_name.lower()] = org_name 
-            # 略称があればマップに追加 {略称: 本名}
+            # 略称があればマップに追加 {略称(小文字): 本名}
             if alias:
                 org_map[alias.lower()] = org_name
-        return org_map
-    except Exception as e:
-        print(f"DB Error during fetching organizations: {e}")
-        return {}
-    finally:
-        session.close()
+    return org_map
 
 def record_attendance(user_id: str, org_name: str, is_proxy: bool):
-    if not Session:
-        return False
-    session = Session()
+    """CSVに出席記録を追加する"""
     try:
-        new_record = Attendance(
-            user_id=user_id,
-            org_name=org_name,
-            is_proxy=is_proxy
-        )
-        session.add(new_record)
-        session.commit()
+        data = load_data(ATTENDANCE_FILE)
+        new_record = {
+            'user_id': user_id,
+            'org_name': org_name,
+            'is_proxy': 'True' if is_proxy else 'False', # CSVは文字列として保存
+            'timestamp': datetime.datetime.utcnow().isoformat()
+        }
+        data.append(new_record)
+        save_data(ATTENDANCE_FILE, ATTENDANCE_HEADERS, data)
         return True
     except Exception as e:
-        session.rollback()
-        print(f"DB Error during attendance recording: {e}")
+        print(f"CSV Error during attendance recording: {e}")
         return False
-    finally:
-        session.close()
 
 def delete_attendance_records(user_id_to_delete=None, is_proxy_status=None):
-    """
-    指定された条件に一致する Attendance レコードをDBから削除する関数
-    """
-    if not Session:
-        return 0 
-    
-    session = Session()
-    deleted_count = 0
-    
+    """指定された条件に一致する Attendance レコードをCSVから削除する"""
     try:
-        query = session.query(Attendance)
+        data = load_data(ATTENDANCE_FILE)
+        deleted_count = 0
+        new_data = []
         
-        # 削除条件の組み立て
-        if user_id_to_delete:
-            query = query.filter(Attendance.user_id == user_id_to_delete)
-        
+        is_proxy_str = None
         if is_proxy_status is not None:
-            query = query.filter(Attendance.is_proxy == is_proxy_status)
+            is_proxy_str = 'True' if is_proxy_status else 'False'
+
+        for record in data:
+            match_user = (user_id_to_delete is None) or (record['user_id'] == user_id_to_delete)
+            match_proxy = (is_proxy_status is None) or (record['is_proxy'] == is_proxy_str)
             
-        # 削除実行 (条件がない場合は、コマンド実行側で制御するため、ここでは実行しない)
-        if user_id_to_delete or is_proxy_status is not None:
-            deleted_count = query.delete(synchronize_session=False)
-            session.commit()
-            return deleted_count
-        else:
-             return 0
+            if match_user and match_proxy:
+                deleted_count += 1
+            else:
+                new_data.append(record)
+
+        # 削除があった場合のみファイルに書き戻す
+        if deleted_count > 0:
+            save_data(ATTENDANCE_FILE, ATTENDANCE_HEADERS, new_data)
+        
+        return deleted_count
         
     except Exception as e:
-        session.rollback()
-        print(f"DB DELETE Error: {e}")
+        print(f"CSV DELETE Error: {e}")
         return -1 
         
-    finally:
-        session.close()
 
 # --- ユーティリティ関数（変更なし） ---
 
@@ -225,7 +200,8 @@ async def ensure_org_channel(guild, role, org_name):
     }
     
     if proxy_role:
-        overwrites[proxy_role] = discord.PermissionOverwrite(read_messages=False)
+        # 団体個室では代理ロールの閲覧を許可しない（デフォルト設定を維持）
+        overwrites[proxy_role] = discord.PermissionOverwrite(read_messages=False) 
 
     if existing_channel:
         await existing_channel.edit(overwrites=overwrites)
@@ -236,9 +212,13 @@ async def ensure_org_channel(guild, role, org_name):
             pass 
 
 # ---------------------------------------------------------
-# ボタンの定義 (既存のロールチェック View)
+# ボタンの定義 (RoleCheckView, AttendanceView)
+# ※ CSVロジックを呼び出すため、コード内の変更は不要です。
 # ---------------------------------------------------------
+
 class RoleCheckView(discord.ui.View):
+    # ... (RoleCheckView クラスの定義は変更なし。get_allowed_orgs_map() を呼び出しています) ...
+
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -253,7 +233,6 @@ class RoleCheckView(discord.ui.View):
         org_map = get_allowed_orgs_map() 
         proxy_role = await get_or_create_proxy_role(guild)
         
-        # 1. ニックネームの代理フラグと団体名抽出
         is_proxy_in_name = bool(re.search(r'(代理|だいり)', display_name, flags=re.IGNORECASE))
         cleaned_name = re.sub(r'(代理|だいり)', '', display_name, flags=re.IGNORECASE).strip()
         match = re.search(r'[@＠](.+)$', cleaned_name)
@@ -267,10 +246,7 @@ class RoleCheckView(discord.ui.View):
             await interaction.followup.send(result_msg, ephemeral=True)
             return
         
-        # ニックネームから抽出された団体名（略称の可能性あり）
         nickname_org_key = match.group(1).strip().lower()
-
-        # 団体名が登録されているかチェックし、登録されている場合はロール名（本名）を取得
         role_org_name = org_map.get(nickname_org_key) 
         
         if not role_org_name:
@@ -278,23 +254,17 @@ class RoleCheckView(discord.ui.View):
         else:
             # 2a. 既存の団体ロールの剥奪
             roles_to_remove = []
-            
-            # DBに登録されている全ての団体ロールをリストアップ
             all_org_names = set(org_map.values())
             
             for user_role in user.roles:
-                # ユーザーが持っているロールが団体ロールリストに含まれているかチェック
                 is_allowed_org_role = user_role.name in all_org_names
 
-                # 代理の場合: 自分の団体ロールを含む全ての団体ロールを剥奪
                 if is_proxy_in_name and is_allowed_org_role:
                     roles_to_remove.append(user_role)
                 
-                # 通常の場合: 自分の団体ロール(role_org_name)以外で、リストに含まれる団体ロールを剥奪
                 elif not is_proxy_in_name and is_allowed_org_role and user_role.name != role_org_name:
                     roles_to_remove.append(user_role)
             
-            # ロール剥奪の実行
             for role_to_remove in roles_to_remove:
                 try:
                     await user.remove_roles(role_to_remove)
@@ -304,7 +274,7 @@ class RoleCheckView(discord.ui.View):
             
             
             if is_proxy_in_name:
-                # 2b. Case A: 代理参加 (団体ロールは付与しない)
+                # 2b. Case A: 代理参加
                 if proxy_role:
                     if proxy_role not in user.roles:
                         try:
@@ -320,9 +290,7 @@ class RoleCheckView(discord.ui.View):
                      result_msg = '❌ 代理ロールが見つからないか作成できませんでした。'
 
             else:
-                # 2c. Case B: 通常参加 (団体ロールを付与)
-                
-                # 代理ロールの剥奪 (通常参加のため)
+                # 2c. Case B: 通常参加
                 if proxy_role and proxy_role in user.roles:
                     try:
                         await user.remove_roles(proxy_role)
@@ -330,8 +298,7 @@ class RoleCheckView(discord.ui.View):
                     except discord.Forbidden:
                         print(f"ERROR: Bot lacks permission to remove proxy role from {user.display_name}")
 
-                # 団体ロール（本名）の付与
-                role = discord.utils.get(guild.roles, name=role_org_name) # 本名のロールを検索
+                role = discord.utils.get(guild.roles, name=role_org_name)
                 created_new_role = False
 
                 if not role:
@@ -370,10 +337,10 @@ class RoleCheckView(discord.ui.View):
                 embed.add_field(name="結果", value=result_msg, inline=False)
                 await log_channel.send(embed=embed)
 
-# ---------------------------------------------------------
-# 出席確認のための新しい View
-# ---------------------------------------------------------
+
 class AttendanceView(discord.ui.View):
+    # ... (AttendanceView クラスの定義は変更なし。record_attendance() を呼び出しています) ...
+
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -385,16 +352,14 @@ class AttendanceView(discord.ui.View):
         display_name = user.display_name
         org_map = get_allowed_orgs_map() 
         
-        # ニックネームから団体名を抽出
         cleaned_name = re.sub(r'(代理|だいり)', '', display_name, flags=re.IGNORECASE).strip()
         match = re.search(r'[@＠](.+)$', cleaned_name)
 
         if not match:
             return await interaction.followup.send('⚠️ 名前に「@団体名」がありません。ニックネームを「名前@団体名」にしてから再度押してください。', ephemeral=True)
         
-        # ニックネームから抽出された団体名（略称の可能性あり）
         nickname_org_key = match.group(1).strip().lower()
-        role_org_name = org_map.get(nickname_org_key) # 本名のロール名を取得
+        role_org_name = org_map.get(nickname_org_key)
         
         if not role_org_name:
             return await interaction.followup.send(f'🚫 団体名「{nickname_org_key}」は登録されていません。管理者に連絡してください。', ephemeral=True)
@@ -430,11 +395,10 @@ class AttendanceView(discord.ui.View):
                  result_msg += '✅ 通常参加としてチェックインしました。'
                  log_msg += '通常参加'
 
-        # DBに出席記録 (ロール名である role_org_name を使用)
         if record_attendance(str(user.id), role_org_name, is_proxy):
             result_msg += '\n✨ 出席を記録しました。'
         else:
-            result_msg += '\n❌ データベースへの出席記録に失敗しました。'
+            result_msg += '\n❌ データベース（CSV）への出席記録に失敗しました。'
             
         log_channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
         if log_channel:
@@ -461,36 +425,28 @@ class AttendanceView(discord.ui.View):
 
 @bot.event
 async def on_ready():
-    if engine:
-        Base.metadata.create_all(engine)
-        print("DBテーブル構造を確認・作成しました。")
-    
+    # CSVファイルは既に初期化済み
+
+    org_map = get_allowed_orgs_map()
+    all_org_names = set(org_map.values()) # 本名のロール名リスト
+
     for guild in bot.guilds:
         proxy_role = await get_or_create_proxy_role(guild)
 
-       # 共有チャンネル権限設定ロジック (変更なし)
         shared_overwrite = discord.PermissionOverwrite(
-        read_messages=True, 
-        send_messages=True, 
-        connect=True,      
-        speak=True          
+            read_messages=True, 
+            send_messages=True, 
+            connect=True,      
+            speak=True          
         )
-
-        # DBから登録されている全ての団体名を取得
-            
-        org_map = get_allowed_orgs_map()
-        all_org_names = set(org_map.values()) # 本名のロール名リスト
-
-        for guild in bot.guilds:
-            proxy_role = await get_or_create_proxy_role(guild)
 
         for category in guild.categories:
             if category.name == SHARED_CATEGORY_NAME: # '会議室' カテゴリ
                 print(f"会議室カテゴリ ({category.name}) の権限を設定中...")
-            
-             # 1. @everyone のアクセスを無効化 (セキュリティのため)
+                
+                # 1. @everyone のアクセスを無効化
                 try:
-                 await category.set_permissions(guild.default_role, overwrite=discord.PermissionOverwrite(read_messages=False))
+                    await category.set_permissions(guild.default_role, overwrite=discord.PermissionOverwrite(read_messages=False))
                 except discord.Forbidden:
                     print(" - ❌ 権限不足によりカテゴリの権限設定ができませんでした。")
                     continue
@@ -503,7 +459,7 @@ async def on_ready():
                     except discord.Forbidden:
                         pass
 
-                # 3. 団体ロールにアクセスを許可 (ここが新しいロジック)
+                # 3. 団体ロールにアクセスを許可
                 for org_name in all_org_names:
                     org_role = discord.utils.get(guild.roles, name=org_name)
                     if org_role:
@@ -513,10 +469,9 @@ async def on_ready():
                         except discord.Forbidden:
                             print(f" - ❌ 団体ロール {org_name} の権限設定に失敗しました。")
 
-
                 print(" - カテゴリ全体の設定完了")
                 
-                # 4. カテゴリ内のチャンネル権限も同様に設定 (これは既存のロジックを再利用)
+                # 4. カテゴリ内のチャンネル権限も同様に設定
                 for channel in category.channels:
                     # チャンネルレベルでも @everyone を無効化
                     await channel.set_permissions(guild.default_role, overwrite=discord.PermissionOverwrite(read_messages=False))
@@ -530,8 +485,7 @@ async def on_ready():
                         org_role = discord.utils.get(guild.roles, name=org_name)
                         if org_role:
                             await channel.set_permissions(org_role, overwrite=shared_overwrite)
-
-        
+                            
     bot.add_view(RoleCheckView())
     bot.add_view(AttendanceView())
     print(f'{bot.user} 起動完了')
@@ -540,6 +494,7 @@ async def on_ready():
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def bulk_proxy_checkin(ctx):
+    # ... (bulk_proxy_checkin コマンドの定義は変更なし。CSV関数を呼び出しています) ...
     guild = ctx.guild
     org_map = get_allowed_orgs_map()
     proxy_role = await get_or_create_proxy_role(guild)
@@ -580,24 +535,21 @@ async def bulk_proxy_checkin(ctx):
                 
                 # 1. 団体ロールの付与/剥奪
                 if is_proxy_in_name:
-                    # 代理の場合: 団体ロールを剥奪 (持っていたら)
                     if org_role in member.roles:
                         try: await member.remove_roles(org_role)
                         except discord.Forbidden: pass
                 else:
-                    # 通常の場合: 団体ロールを付与
                     if org_role not in member.roles:
                         try: await member.add_roles(org_role)
                         except discord.Forbidden: pass
 
-                    # 他の団体ロールの剥奪
                     for user_role in member.roles:
                         if user_role.name in all_org_names and user_role.name != role_org_name:
                             try: await member.remove_roles(user_role)
                             except discord.Forbidden: pass
 
 
-                # 2. 代理ステータスの処理とDB記録
+                # 2. 代理ステータスの処理とCSV記録
                 if is_proxy_in_name:
                     if proxy_role not in member.roles:
                         try:
@@ -623,7 +575,7 @@ async def bulk_proxy_checkin(ctx):
         f"・処理されたメンバー数: {processed_count}名\n"
         f"・新たに代理ロールが付与されたメンバー: {proxy_added_count}名\n"
         f"・代理ロールが剥奪されたメンバー: {proxy_removed_count}名\n"
-        f"※ DBへの記録も行いました。"
+        f"※ CSVへの記録も行いました。"
     )
     await ctx.send(report_message)
     log_channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
@@ -634,16 +586,7 @@ async def bulk_proxy_checkin(ctx):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def delete_attendance(ctx, target: discord.Member = None, proxy_status: str = None):
-    """
-    Attendance (出席記録) テーブルからレコードを削除する。
-    - target: 削除したいユーザー (@ユーザー名)
-    - proxy_status: 削除したいステータス ('proxy' または 'regular')
-    例: !delete_attendance @User proxy (指定ユーザーの代理記録を削除)
-    例: !delete_attendance proxy (全ユーザーの代理記録を削除)
-    """
-    if not Session:
-        return await ctx.send('❌ データベース接続が確立されていません。')
-
+    # ... (delete_attendance コマンドの定義は変更なし。CSV関数を呼び出しています) ...
     await ctx.defer()
     user_id = str(target.id) if target else None
     
@@ -655,11 +598,9 @@ async def delete_attendance(ctx, target: discord.Member = None, proxy_status: st
     elif proxy_status:
         return await ctx.send("❌ `proxy_status`は 'proxy' または 'regular' のみを指定してください。")
 
-    # 削除条件が一つも指定されていない場合はエラー
     if not user_id and is_proxy_delete is None:
         return await ctx.send("❌ **削除を実行するには、対象ユーザー (@ユーザー名) または削除したいステータス ('proxy'/'regular') の少なくとも一方を指定してください。**")
 
-    # ユーザー指定がない（全ユーザー対象）場合のみ確認を求める
     if not target:
         status_text = f"**{'代理' if is_proxy_delete else '通常'}**の出席記録" if is_proxy_delete is not None else "全ての出席記録"
         await ctx.send(f"⚠️ **警告**: 対象ユーザーが指定されていません。全ユーザーの{status_text}が対象になります。続行しますか？ (`yes` / `no`)")
@@ -674,15 +615,14 @@ async def delete_attendance(ctx, target: discord.Member = None, proxy_status: st
         except asyncio.TimeoutError:
             return await ctx.send("タイムアウトしました。操作をキャンセルします。")
     
-    # 削除実行
     deleted_count = delete_attendance_records(user_id, is_proxy_delete)
     
     if deleted_count > 0:
-        await ctx.send(f"✅ DBから**{deleted_count}件**の出席記録を削除しました。")
+        await ctx.send(f"✅ CSVから**{deleted_count}件**の出席記録を削除しました。")
     elif deleted_count == 0:
         await ctx.send("ℹ️ 削除条件に一致するレコードは見つかりませんでした。")
     else:
-        await ctx.send("❌ DBの削除中にエラーが発生しました。ログを確認してください。")
+        await ctx.send("❌ CSVの削除中にエラーが発生しました。")
 
 
 @bot.command()
@@ -704,73 +644,61 @@ async def attend_panel(ctx):
     await ctx.send(embed=embed, view=AttendanceView())
 
 @bot.command()
+@commands.has_permissions(administrator=True)
 async def add_org(ctx, org_name: str, alias: str = None):
-    """団体名（ロール名）と必要に応じて略称をDBに追加する (修正)"""
-    if not Session:
-        await ctx.send('❌ データベース接続が確立されていません。')
-        return
-        
-    session = Session()
+    """団体名（ロール名）と必要に応じて略称をCSVに追加する"""
     try:
-        if session.query(OrgSettings).filter_by(org_name=org_name).first():
-            await ctx.send(f'⚠️ 団体名「{org_name}」は既に登録されています。')
-        elif alias and session.query(OrgSettings).filter_by(alias=alias).first():
-             await ctx.send(f'⚠️ 略称「{alias}」は既に他の団体で使用されています。')
-        else:
-            new_org = OrgSettings(org_name=org_name, alias=alias)
-            session.add(new_org)
-            session.commit()
-            msg = f'✅ 団体名リスト（DB）に「{org_name}」を追加しました。'
-            if alias:
-                msg += f' (略称: {alias})'
-            await ctx.send(msg)
+        orgs_data = load_data(ORG_FILE)
+        
+        # 重複チェック
+        for org in orgs_data:
+            if org['org_name'] == org_name:
+                await ctx.send(f'⚠️ 団体名「{org_name}」は既に登録されています。')
+                return
+            if alias and org['alias'] == alias:
+                 await ctx.send(f'⚠️ 略称「{alias}」は既に他の団体で使用されています。')
+                 return
+        
+        # 新規追加
+        new_org = {'org_name': org_name, 'alias': alias if alias else ''}
+        orgs_data.append(new_org)
+        save_data(ORG_FILE, ORG_HEADERS, orgs_data)
+        
+        msg = f'✅ 団体名リスト（CSV）に「{org_name}」を追加しました。'
+        if alias:
+            msg += f' (略称: {alias})'
+        await ctx.send(msg)
+        
     except Exception as e:
-        session.rollback()
-        await ctx.send(f'❌ DBへの書き込みに失敗しました: {e}')
-    finally:
-        session.close()
+        await ctx.send(f'❌ CSVへの書き込みに失敗しました: {e}')
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def delete_org(ctx, org_identifier: str):
     """
-    団体名（ロール名）または略称を指定して、OrgSettingsから団体設定を削除します。
+    団体名（ロール名）または略称を指定して、CSVから団体設定を削除します。
     """
-    if not Session:
-        return await ctx.send('❌ データベース接続が確立されていません。')
-
-    session = Session()
     try:
-        # 本名（org_name）または略称（alias）でレコードを検索
-        # ※ aliasは、OrgSettingsクラスで定義されているカラム名です。
-        org = session.query(OrgSettings).filter(
-            (OrgSettings.org_name == org_identifier) | (OrgSettings.alias == org_identifier)
-        ).first()
+        orgs_data = load_data(ORG_FILE)
+        new_data = []
+        deleted = False
         
-        if org:
-            # レコードが見つかった場合、削除を実行
-            session.delete(org)
-            session.commit()
-            await ctx.send(f"✅ 団体設定 **{org_identifier}**（本名: {org.org_name}）の削除が完了しました。")
+        # 本名または略称でレコードを検索し、削除対象でなければ new_data に追加
+        for org in orgs_data:
+            if org['org_name'] == org_identifier or org['alias'] == org_identifier:
+                deleted = True
+                deleted_org_name = org['org_name'] # 削除した本名を保持
+            else:
+                new_data.append(org)
+
+        if deleted:
+            save_data(ORG_FILE, ORG_HEADERS, new_data)
+            await ctx.send(f"✅ 団体設定 **{org_identifier}**（本名: {deleted_org_name}）の削除が完了しました。")
         else:
             await ctx.send(f"❌ 団体設定 **{org_identifier}** は見つかりませんでした。本名または略称を確認してください。")
             
     except Exception as e:
-        session.rollback()
-        await ctx.send(f"❌ DBでの削除中にエラーが発生しました: {e}")
-        print(f"団体設定の削除中にエラーが発生しました: {e}")
-    finally:
-        session.close()
-
-@delete_org.error
-async def delete_org_error(ctx, error):
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("❌ 削除したい団体名（本名または略称）を指定してください。例: `!delete_org テニス部`")
-    elif isinstance(error, commands.MissingPermissions):
-        # 権限エラーの場合、ここではエラーメッセージを送信しない（デフォルト動作を利用）
-        pass
-    else:
-        print(f"delete_orgコマンドで予期せぬエラー: {error}")
+        await ctx.send(f"❌ CSVでの削除中にエラーが発生しました: {e}")
 
 @bot.command()
 async def list_orgs(ctx):
@@ -778,25 +706,24 @@ async def list_orgs(ctx):
     if org_map:
         output = '📋 **登録済み団体名 (本名 / 略称):**\n'
         
-        # ロール名（本名）と略称をペアで出力するためにDBから直接取得
-        session = Session()
-        try:
-            orgs = session.query(OrgSettings.org_name, OrgSettings.alias).all()
-            for org_name, alias in orgs:
-                output += f'- {org_name}'
-                if alias:
-                    output += f' / {alias}'
-                output += '\n'
-        except Exception:
-            output = '❌ データベースからの読み込みに失敗しました。'
-        finally:
-            session.close()
+        # CSVから直接データを取得して表示
+        orgs_data = load_data(ORG_FILE)
+        
+        for org in orgs_data:
+            org_name = org.get('org_name')
+            alias = org.get('alias')
+            
+            output += f'- {org_name}'
+            if alias:
+                output += f' / {alias}'
+            output += '\n'
 
         await ctx.send(output)
     else:
-        await ctx.send('現在登録されている団体名はありません。（またはDB接続エラー）')
+        await ctx.send('現在登録されている団体名はありません。（CSVファイルにデータがありません）')
 
 # --- 最終起動処理 ---
+
 keep_alive() 
 
 if DISCORD_TOKEN:
