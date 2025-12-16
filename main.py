@@ -411,6 +411,62 @@ class AttendanceView(discord.ui.View):
 
         await interaction.followup.send(result_msg, ephemeral=True)
 
+    @discord.ui.button(label="🔊 通話中メンバーレポート", style=discord.ButtonStyle.blurple, custom_id="voice_check_button")
+    async def voice_check_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """通話チャンネルにいるメンバーの団体名とユーザー名を出力する"""
+        
+        # 処理が長くなる可能性があるため、すぐにリアクションを返す
+        await interaction.response.defer(ephemeral=False) # ephemaral=False で全員に見えるようにする
+
+        guild = interaction.guild
+        org_map = get_allowed_orgs_map() # 登録団体リストをCSVから取得
+
+        members_in_voice = []
+        
+        # サーバー内の全メンバーをチェック
+        for member in guild.members:
+            # 通話チャンネルに接続しており、かつミュート/デフされていないメンバー（ミュート状態でも通話中と見なす）
+            if member.voice and member.voice.channel:
+                
+                # 団体名を解析（!panelと同じロジックを使用）
+                display_name = member.display_name
+                cleaned_name = re.sub(r'(代理|だいり)', '', display_name, flags=re.IGNORECASE).strip()
+                match = re.search(r'[@＠](.+)$', cleaned_name)
+                
+                org_name_display = "不明/未登録"
+                if match:
+                    nickname_org_key = match.group(1).strip().lower()
+                    org_name = org_map.get(nickname_org_key)
+                    if org_name:
+                        org_name_display = org_name # 本名を取得
+
+                members_in_voice.append({
+                    'username': member.display_name,
+                    'org_name': org_name_display,
+                    'channel_name': member.voice.channel.name
+                })
+
+        # レポートの作成
+        if not members_in_voice:
+            return await interaction.followup.send("現在、通話チャンネルに誰もいません。", ephemeral=False)
+
+        # レポートを団体名でソート
+        members_in_voice.sort(key=lambda m: m['org_name'])
+        
+        report = "🔊 **現段階での会議出席メンバー一覧**\n"
+        report += "```\n"
+        # ヘッダー (日本語の全角文字を考慮してスペースを調整)
+        report += f"{'団体名':<15} | {'ユーザー名 (ニックネーム)':<30} | {'VC名'}\n"
+        report += "-" * 60 + "\n"
+        
+        # データ行
+        for m in members_in_voice:
+            # 文字列フォーマットの幅調整は全角文字で崩れるため、ここでは簡略化
+            report += f"{m['org_name']} | {m['username']} | {m['channel_name']}\n"
+        
+        report += "```"
+
+        await interaction.followup.send(report, ephemeral=False)
 
     @discord.ui.button(label="通常参加でチェックイン", style=discord.ButtonStyle.green, custom_id="checkin_regular_button")
     async def checkin_regular_button(self, interaction: discord.Interaction, button: discord.ui.Button):
