@@ -38,44 +38,43 @@ class OrgSettings(Base):
     alias = Column(String, nullable=True)
     exclude_leader = Column(Boolean, default=False)
 
-class Attendance(Base):
-    __tablename__ = 'attendance'
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    guild_id = Column(String)
-    user_id = Column(String)
-    org_name = Column(String)
-    is_proxy = Column(Boolean)
-    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
-
 Base.metadata.create_all(engine)
 
 # --- Discord Bot 実装 ---
-intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
-intents.guilds = True
+# 全てのインテントを明示的に有効化
+intents = discord.Intents.all() 
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+@bot.event
+async def on_ready():
+    # 永続Viewの再登録
+    bot.add_view(RoleCheckView())
+    print(f"✅ Bot Connected: {bot.user.name} (ID: {bot.user.id})")
 
-# 【修正】コマンドを確実に実行させるためのイベント
+# コマンドが反応しないのを防ぐための最優先処理
 @bot.event
 async def on_message(message):
-    if message.author == bot.user:
+    if message.author.bot:
         return
-    # コマンドを処理する
+    # ログに届いたメッセージを出力（デバッグ用）
+    print(f"📩 Message from {message.author}: {message.content}")
     await bot.process_commands(message)
 
-# --- UI Views (ボタン処理) ---
-
+# --- UI Views (所属確認ボタン) ---
 class RoleCheckView(discord.ui.View):
-    def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label="所属を同期する", style=discord.ButtonStyle.primary, custom_id="v_full_sync_v2")
+    def __init__(self):
+        super().__init__(timeout=None)
+    
+    @discord.ui.button(label="所属を同期する", style=discord.ButtonStyle.primary, custom_id="v_last_sync")
     async def sync(self, interaction: discord.Interaction, button: discord.ui.Button):
+        print(f"🔘 Button pressed by {interaction.user}")
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         display_name = interaction.user.display_name
+        
         match = re.search(r'[@＠](.+)$', display_name)
-        if not match: return await interaction.followup.send("⚠️ 名前を「@団体名」にしてください。")
+        if not match:
+            return await interaction.followup.send("⚠️ 名前を「名前@団体名」にしてください。")
         
         session = Session()
         config = session.query(ServerConfig).filter_by(guild_id=str(guild.id)).first()
@@ -90,86 +89,52 @@ class RoleCheckView(discord.ui.View):
         ).first()
         session.close()
 
-        if not org: return await interaction.followup.send(f"🚫 「{org_key}」は未登録です。")
+        if not org:
+            return await interaction.followup.send(f"🚫 「{org_key}」は未登録です。")
+
+        # ロールとチャンネルの同期
+        role = discord.utils.get(guild.roles, name=org.org_name) or await guild.create_role(name=org.org_name)
+        await interaction.user.add_roles(role)
         
-        org_role = discord.utils.get(guild.roles, name=org.org_name) or await guild.create_role(name=org.org_name)
-        await interaction.user.add_roles(org_role)
-        
-        is_proxy = "代理" in display_name
-        leader_role = discord.utils.get(guild.roles, name=config.leader_role_name) or await guild.create_role(name=config.leader_role_name)
-        
-        if not org.exclude_leader and not is_proxy:
-            await interaction.user.add_roles(leader_role)
-            msg = f"✅ {org.org_name} 同期完了（部長付与）"
-        else:
-            if leader_role in interaction.user.roles: await interaction.user.remove_roles(leader_role)
-            msg = f"✅ {org.org_name} 同期完了"
+        if "代理" not in display_name and not org.exclude_leader:
+            l_role = discord.utils.get(guild.roles, name=config.leader_role_name) or await guild.create_role(name=config.leader_role_name)
+            await interaction.user.add_roles(l_role)
         
         cat = discord.utils.get(guild.categories, name=config.target_category)
         if cat:
             ch_name = org.org_name.lower().replace(" ", "-")
             if not any(ch_name in c.name.lower() for c in cat.text_channels):
                 overwrites = {guild.default_role: discord.PermissionOverwrite(read_messages=False),
-                              org_role: discord.PermissionOverwrite(read_messages=True),
+                              role: discord.PermissionOverwrite(read_messages=True),
                               guild.me: discord.PermissionOverwrite(read_messages=True)}
                 await guild.create_text_channel(ch_name, category=cat, overwrites=overwrites)
-        await interaction.followup.send(msg)
-
-class AttendanceView(discord.ui.View):
-    def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label="通常参加", style=discord.ButtonStyle.green, custom_id="v_full_reg_v2")
-    async def reg(self, interaction, button): await self._proc(interaction, False)
-    @discord.ui.button(label="代理参加", style=discord.ButtonStyle.red, custom_id="v_full_prx_v2")
-    async def prx(self, interaction, button): await self._proc(interaction, True)
-    
-    async def _proc(self, interaction, is_proxy):
-        await interaction.response.defer(ephemeral=True)
-        match = re.search(r'[@＠](.+)$', interaction.user.display_name)
-        if not match: return await interaction.followup.send("⚠️ 名前修正を！")
         
-        session = Session()
-        org = session.query(OrgSettings).filter(
-            OrgSettings.guild_id == str(interaction.guild.id),
-            ((OrgSettings.org_name.ilike(match.group(1).strip())) | (OrgSettings.alias.ilike(match.group(1).strip())))
-        ).first()
-        
-        if not org: 
-            session.close()
-            return await interaction.followup.send("🚫 団体未登録")
-            
-        session.add(Attendance(guild_id=str(interaction.guild.id), user_id=str(interaction.user.id), org_name=org.org_name, is_proxy=is_proxy))
-        session.commit(); session.close()
-        await interaction.followup.send("✅ 出席を記録しました。")
+        await interaction.followup.send(f"✅ {org.org_name} 同期完了")
 
-# --- Bot 本体 ---
-
-@bot.event
-async def on_ready():
-    bot.add_view(RoleCheckView()); bot.add_view(AttendanceView())
-    print(f"✅ Bot Online: {bot.user}")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def panel(ctx): await ctx.send("**所属確認パネル**", view=RoleCheckView())
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def attend_panel(ctx): await ctx.send("**出席記録パネル**", view=AttendanceView())
-
-@bot.command()
+# --- 管理コマンド ---
+@bot.command(name="add_org")
 @commands.has_permissions(administrator=True)
 async def add_org(ctx, name: str, alias: str = None, exclude: bool = False):
+    print(f"🛠 Running add_org: {name}")
     s = Session()
     s.add(OrgSettings(guild_id=str(ctx.guild.id), org_name=name, alias=alias, exclude_leader=exclude))
     s.commit(); s.close()
     await ctx.send(f"✅ {name} を登録しました。")
 
+@bot.command(name="panel")
+@commands.has_permissions(administrator=True)
+async def panel(ctx):
+    await ctx.send("【認証パネル】", view=RoleCheckView())
+
 # --- インフラ維持 ---
 app = Flask(__name__)
 @app.route('/')
-def h(): return "ok"
-def run_flask(): app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
-def ping():
+def h(): return "Bot is Alive"
+
+def run_flask():
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+
+def ping_loop():
     time.sleep(20)
     while True:
         try:
@@ -181,5 +146,5 @@ def ping():
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    threading.Thread(target=ping, daemon=True).start()
+    threading.Thread(target=ping_loop, daemon=True).start()
     bot.run(os.environ.get("DISCORD_TOKEN"))
