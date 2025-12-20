@@ -7,20 +7,16 @@ import discord
 from discord.ext import commands
 import requests
 import time
-import asyncio
 import datetime
 
-# --- SQLAlchemy 設定 (Supabase用) ---
-from sqlalchemy import create_engine, Column, String, Boolean, DateTime
+# --- SQLAlchemy 設定 (Supabase永続化) ---
+from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Integer
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
-if DATABASE_URL is None:
-    print("FATAL ERROR: DATABASE_URL が設定されていません。")
+if not DATABASE_URL:
     sys.exit(1)
-
-# SQLAlchemy形式への変換
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -28,185 +24,191 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 Session = sessionmaker(bind=engine)
 Base = declarative_base()
 
+# サーバーごとの設定
+class ServerConfig(Base):
+    __tablename__ = 'server_config'
+    guild_id = Column(String, primary_key=True)
+    guild_name = Column(String)
+    target_category = Column(String, default="団体用")
+    leader_role_name = Column(String, default="部長") 
+
+# 団体ごとの設定
 class OrgSettings(Base):
     __tablename__ = 'org_settings'
-    org_name = Column(String, primary_key=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    guild_id = Column(String)
+    org_name = Column(String)
     alias = Column(String, nullable=True)
+    exclude_leader = Column(Boolean, default=False)
 
+# 出席記録
 class Attendance(Base):
     __tablename__ = 'attendance'
-    user_id = Column(String, primary_key=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    guild_id = Column(String)
+    user_id = Column(String)
     org_name = Column(String)
     is_proxy = Column(Boolean)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
 
-# 自動テーブル作成
 Base.metadata.create_all(engine)
 
-# --- 定数 ---
-LOG_CHANNEL_NAME = '管理ログ'
-PROXY_ROLE_NAME = 'Proxy Attendee' 
-SHARED_CATEGORY_NAME = '会議室'
-
-# --- Flask & 生存確認 (Supabaseのスリープ防止) ---
-app = Flask(__name__) 
-
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-def ping_self():
-    url = os.environ.get("RENDER_EXTERNAL_URL")
-    if not url: return
-    while True:
-        try:
-            requests.get(url)
-        except: pass
-        time.sleep(300)
-
-def keep_db_alive():
-    """1時間に1回DBにアクセスしてSupabaseのポーズを防ぐ"""
-    while True:
-        try:
-            session = Session()
-            session.query(OrgSettings).first()
-            session.close()
-            print("DB Ping: OK")
-        except Exception as e:
-            print(f"DB Ping Error: {e}")
-        time.sleep(3600)
-
-def keep_alive():
-    Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))).start()
-    Thread(target=ping_self).start()
-    Thread(target=keep_db_alive).start()
-
-# --- DB操作関数 ---
-
-def get_allowed_orgs_map():
+# --- 共通ロジック ---
+def get_server_config(guild_id, guild_name):
     session = Session()
-    try:
-        org_map = {}
-        for org in session.query(OrgSettings).all():
-            org_map[org.org_name.lower()] = org.org_name
-            if org.alias: org_map[org.alias.lower()] = org.org_name
-        return org_map
-    finally: session.close()
+    config = session.query(ServerConfig).filter_by(guild_id=str(guild_id)).first()
+    if not config:
+        config = ServerConfig(guild_id=str(guild_id), guild_name=guild_name)
+        session.add(config)
+        session.commit()
+    session.close()
+    return config
 
-# --- チャンネル・権限ロジック ---
+def get_allowed_orgs_map(guild_id):
+    session = Session()
+    orgs = session.query(OrgSettings).filter_by(guild_id=str(guild_id)).all()
+    org_map = {}
+    for o in orgs:
+        org_map[o.org_name.lower()] = o
+        if o.alias: org_map[o.alias.lower()] = o
+    session.close()
+    return org_map
 
-async def sync_org_channel_permissions(guild, role, org_name):
-    category = discord.utils.get(guild.categories, name=SHARED_CATEGORY_NAME)
-    if not category:
-        print(f"ERROR: カテゴリ '{SHARED_CATEGORY_NAME}' が見つかりません。")
-        return
-
-    search_name = org_name.lower().replace(" ", "-")
-    target_channel = None
-    for channel in category.text_channels:
-        if search_name in channel.name.lower():
-            target_channel = channel
-            break
-
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(read_messages=False),
-        role: discord.PermissionOverwrite(read_messages=True),
-        guild.me: discord.PermissionOverwrite(read_messages=True)
-    }
-
-    if target_channel:
-        try:
-            await target_channel.edit(overwrites=overwrites)
-        except Exception as e:
-            print(f"ERROR: 既存チャンネル更新失敗: {e}")
-    else:
-        try:
-            await guild.create_text_channel(search_name, category=category, overwrites=overwrites)
-        except Exception as e:
-            print(f"ERROR: 新規作成失敗: {e}")
-
-# --- Discord Bot UI ---
+# --- UI Views ---
 
 class RoleCheckView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="ロール・個室を自動取得", style=discord.ButtonStyle.green, custom_id="check_role_v3")
-    async def check_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    def __init__(self): super().__init__(timeout=None)
+    
+    @discord.ui.button(label="所属を同期する", style=discord.ButtonStyle.primary, custom_id="v8_sync")
+    async def sync(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        user = interaction.user
         guild = interaction.guild
+        config = get_server_config(guild.id, guild.name)
+        display_name = interaction.user.display_name
         
-        org_map = get_allowed_orgs_map()
-        match = re.search(r'[@＠](.+)$', user.display_name)
-        
-        if not match:
-            return await interaction.followup.send("⚠️ ニックネームを「名前@団体名」にしてください。", ephemeral=True)
+        match = re.search(r'[@＠](.+)$', display_name)
+        if not match: return await interaction.followup.send("⚠️ 名前を「名前@団体名」にしてください。")
         
         org_key = match.group(1).strip().lower()
-        role_name = org_map.get(org_key)
+        org_map = get_allowed_orgs_map(guild.id)
+        org = org_map.get(org_key)
+
+        if not org: return await interaction.followup.send(f"🚫 「{org_key}」はこのサーバーに未登録です。")
+
+        # 団体ロール付与
+        org_role = discord.utils.get(guild.roles, name=org.org_name) or await guild.create_role(name=org.org_name)
+        await interaction.user.add_roles(org_role)
         
-        if not role_name:
-            return await interaction.followup.send(f"🚫 団体名「{org_key}」は未登録です。", ephemeral=True)
+        # 部長ロール判定 (代理が名前にあれば除外)
+        is_proxy_user = "代理" in display_name
+        leader_msg = ""
+        leader_role = discord.utils.get(guild.roles, name=config.leader_role_name) or await guild.create_role(name=config.leader_role_name)
+        
+        if not org.exclude_leader and not is_proxy_user:
+            await interaction.user.add_roles(leader_role)
+            leader_msg = f" ＆ 「{config.leader_role_name}」"
+        else:
+            if leader_role in interaction.user.roles: await interaction.user.remove_roles(leader_role)
+            leader_msg = "（代理/除外のため役職なし）"
+        
+        # チャンネル同期
+        category = discord.utils.get(guild.categories, name=config.target_category)
+        if category:
+            chan_name = org.org_name.lower().replace(" ", "-")
+            overwrites = {guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                          org_role: discord.PermissionOverwrite(read_messages=True),
+                          guild.me: discord.PermissionOverwrite(read_messages=True)}
+            if not any(chan_name in c.name.lower() for c in category.text_channels):
+                await guild.create_text_channel(chan_name, category=category, overwrites=overwrites)
+        
+        await interaction.followup.send(f"✅ {org.org_name}{leader_msg} 同期完了")
 
-        role = discord.utils.get(guild.roles, name=role_name)
-        if not role:
-            try:
-                role = await guild.create_role(name=role_name, mentionable=True)
-            except discord.Forbidden:
-                return await interaction.followup.send("❌ Botに「ロールの管理」権限がないか、ロール順位が低いため作成できませんでした。", ephemeral=True)
+class AttendanceView(discord.ui.View):
+    def __init__(self): super().__init__(timeout=None)
+    
+    @discord.ui.button(label="通常参加", style=discord.ButtonStyle.green, custom_id="v8_reg")
+    async def reg(self, interaction, button): await self._proc(interaction, False)
+    
+    @discord.ui.button(label="代理参加", style=discord.ButtonStyle.red, custom_id="v8_prx")
+    async def prx(self, interaction, button): await self._proc(interaction, True)
+    
+    @discord.ui.button(label="🔊 通話中レポート", style=discord.ButtonStyle.blurple, custom_id="v8_vc")
+    async def vc(self, interaction, button):
+        if not interaction.user.guild_permissions.administrator: return await interaction.response.send_message("管理者のみ", ephemeral=True)
+        await interaction.response.defer()
+        org_map = get_allowed_orgs_map(interaction.guild.id)
+        v_list = []
+        for m in interaction.guild.members:
+            if m.voice:
+                match = re.search(r'[@＠](.+)$', m.display_name)
+                org_obj = org_map.get(match.group(1).strip().lower()) if match else None
+                org_name = org_obj.org_name if org_obj else "不明"
+                v_list.append(f"{org_name} | {m.display_name} | {m.voice.channel.name}")
+        await interaction.followup.send("🔊 **通話中一覧**\n```\n" + ("\n".join(v_list) if v_list else "なし") + "\n```")
 
-        try:
-            await user.add_roles(role)
-            await sync_org_channel_permissions(guild, role, role_name)
-            await interaction.followup.send(f"✅ 「{role_name}」のロール付与とチャンネル確認が完了しました。", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.followup.send("❌ ロールを付与する権限がBotにありません。サーバー設定でBotのロール順位を上げてください。", ephemeral=True)
+    async def _proc(self, interaction, is_proxy):
+        await interaction.response.defer(ephemeral=True)
+        match = re.search(r'[@＠](.+)$', interaction.user.display_name)
+        if not match: return await interaction.followup.send("⚠️ 名前を「@団体名」にしてください。")
+        org_map = get_allowed_orgs_map(interaction.guild.id)
+        org = org_map.get(match.group(1).strip().lower())
+        if not org: return await interaction.followup.send("🚫 団体未登録です。")
+        
+        session = Session()
+        session.add(Attendance(guild_id=str(interaction.guild.id), user_id=str(interaction.user.id), org_name=org.org_name, is_proxy=is_proxy))
+        session.commit()
+        session.close()
+        await interaction.followup.send(f"✅ {'代理' if is_proxy else '通常'}出席を記録しました。")
 
 # --- Bot 本体 ---
-
 intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
+intents.members = intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
-    bot.add_view(RoleCheckView())
-    print(f'{bot.user} 起動完了')
+    bot.add_view(RoleCheckView()); bot.add_view(AttendanceView())
+    print(f"Logged in: {bot.user}")
+
+# --- コマンド群 ---
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def panel(ctx): await ctx.send("**所属確認パネル**", view=RoleCheckView())
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def panel(ctx):
-    embed = discord.Embed(title="所属確認", description="ボタンを押すと、名前に合わせたロール付与と専用個室の同期を行います。", color=discord.Color.blue())
-    await ctx.send(embed=embed, view=RoleCheckView())
+async def attend_panel(ctx): await ctx.send("**出席確認パネル**", view=AttendanceView())
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def add_org(ctx, name: str, alias: str = None):
+async def add_org(ctx, name: str, alias: str = None, exclude_leader: bool = False):
     session = Session()
-    try:
-        exists = session.query(OrgSettings).filter_by(org_name=name).first()
-        if exists:
-            return await ctx.send(f"⚠️ {name} は既に登録されています。")
-            
-        session.add(OrgSettings(org_name=name, alias=alias))
-        session.commit()
-        await ctx.send(f"✅ {name} を登録しました。")
-    except Exception as e:
-        session.rollback()
-        await ctx.send("❌ 登録失敗。DB接続を確認してください。")
-    finally:
-        session.close()
+    session.add(OrgSettings(guild_id=str(ctx.guild.id), org_name=name, alias=alias, exclude_leader=exclude_leader))
+    session.commit(); session.close()
+    await ctx.send(f"✅ {name} を登録しました。")
 
 @bot.command()
-async def list_orgs(ctx):
+@commands.has_permissions(administrator=True)
+async def clear_attendance(ctx):
     session = Session()
-    orgs = session.query(OrgSettings).all()
-    if not orgs: return await ctx.send("登録されている団体はありません。")
-    msg = "📋 **登録団体リスト:**\n" + "\n".join([f"・{o.org_name} (略称: {o.alias})" for o in orgs])
-    await ctx.send(msg)
-    session.close()
+    session.query(Attendance).filter_by(guild_id=str(ctx.guild.id)).delete()
+    session.commit(); session.close()
+    await ctx.send("✅ このサーバーの出席記録をすべて削除しました。")
 
-keep_alive()
-bot.run(os.environ.get("DISCORD_TOKEN"))
+# --- 生存維持 ---
+app = Flask(__name__)
+@app.route('/')
+def h(): return "ok"
+def keep_alive():
+    Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))).start()
+    while True:
+        try:
+            url = os.environ.get("RENDER_EXTERNAL_URL")
+            if url: requests.get(url)
+            Session().query(ServerConfig).first()
+        except: pass
+        time.sleep(300)
+
+if __name__ == "__main__":
+    keep_alive()
+    bot.run(os.environ.get("DISCORD_TOKEN"))
