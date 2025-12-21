@@ -8,8 +8,9 @@ from discord.ext import commands
 from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Integer
 from sqlalchemy.orm import sessionmaker, declarative_base
 import datetime
+import asyncio
 
-# --- DB設定 (v8に刷新) ---
+# --- DB設定 (v8) ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -30,7 +31,7 @@ class AttendanceLog(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(String)
     org_name = Column(String)
-    status = Column(String) # "通常", "代理", "終了"
+    status = Column(String)
     timestamp = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))))
 
 Base.metadata.create_all(engine)
@@ -46,24 +47,23 @@ def fetch_all_orgs():
     finally: session.close()
 
 # --- 共通処理: 同期ロジックコア ---
-async def core_sync_logic(user, guild):
+async def core_sync_logic(user, guild, all_orgs):
+    if user.bot: return None
     match = re.search(r'[@＠](.+)$', user.display_name)
-    if not match: return "⚠️ 名前を「名前@団体名」にしてください。"
+    if not match: return f"⚠️ {user.display_name}: 名前形式不備"
     
     org_key = match.group(1).strip().lower()
-    all_orgs = fetch_all_orgs()
     org_map = {o.org_name.lower(): o for o in all_orgs}
     for o in all_orgs:
         if o.alias: org_map[o.alias.lower()] = o
         
     target_org = org_map.get(org_key)
-    if not target_org: return f"🚫 「{org_key}」は未登録です。"
+    if not target_org: return f"🚫 {user.display_name}: 「{org_key}」未登録"
 
-    # ロール掃除 (全団体 + 部長 + 代理)
+    # ロール掃除
     all_org_names = [o.org_name for o in all_orgs]
     cleanup_list = all_org_names + [LEADER_ROLE_NAME, PROXY_ROLE_NAME]
     roles_to_remove = [r for r in user.roles if r.name in cleanup_list and r.name != target_org.org_name]
-    
     if roles_to_remove: await user.remove_roles(*roles_to_remove)
 
     # ロール付与
@@ -77,7 +77,7 @@ async def core_sync_logic(user, guild):
     elif not target_org.exclude_leader:
         await user.add_roles(leader_role)
 
-    # 部屋作成/同期
+    # 部屋作成
     cat = discord.utils.get(guild.categories, name=CATEGORY_NAME) or await guild.create_category(CATEGORY_NAME)
     ch_name = target_org.org_name.lower().replace(" ", "-")
     target_channel = next((c for c in cat.text_channels if ch_name in c.name.lower()), None)
@@ -89,24 +89,44 @@ async def core_sync_logic(user, guild):
     if not target_channel: await guild.create_text_channel(ch_name, category=cat, overwrites=overwrites)
     else: await target_channel.edit(overwrites=overwrites)
     
-    return f"✅ {target_org.org_name} の同期を完了しました。"
+    return f"✅ {user.display_name}: {target_org.org_name} 同期完了"
 
 # --- UI Views ---
 class MultiFunctionView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
 
-    @discord.ui.button(label="ロール・個室同期", style=discord.ButtonStyle.green, custom_id="sync_v8")
-    async def sync_btn(self, interaction: discord.Interaction, button):
-        await interaction.response.defer(ephemeral=True)
-        res = await core_sync_logic(interaction.user, interaction.guild)
-        await interaction.followup.send(res)
+    @discord.ui.button(label="全員一括同期", style=discord.ButtonStyle.danger, custom_id="sync_all_v8")
+    async def sync_all_btn(self, interaction: discord.Interaction, button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ 管理者のみ実行可能です。", ephemeral=True)
+        
+        await interaction.response.send_message("🔄 全員の同期を開始します。人数が多い場合は時間がかかります...", ephemeral=True)
+        
+        all_orgs = fetch_all_orgs()
+        success_count = 0
+        results = []
+        
+        # サーバーの全メンバーをループ処理
+        async for member in interaction.guild.fetch_members(limit=None):
+            if member.bot: continue
+            res = await core_sync_logic(member, interaction.guild, all_orgs)
+            if res and "✅" in res:
+                success_count += 1
+            elif res:
+                results.append(res)
+            # Discordの制限（レートリミット）を避けるため少し休憩
+            await asyncio.sleep(0.5)
+
+        report = f"📊 **一括同期レポート**\n成功: {success_count} 名\n不備: {len(results)} 名\n"
+        if results:
+            report += "```\n" + "\n".join(results[:15]) + ("\n...他" if len(results) > 15 else "") + "\n```"
+        
+        await interaction.followup.send(report)
 
     @discord.ui.button(label="通常出席", style=discord.ButtonStyle.primary, custom_id="att_n_v8")
     async def att_n(self, interaction, button): await self._log(interaction, "通常")
-
     @discord.ui.button(label="代理出席", style=discord.ButtonStyle.danger, custom_id="att_p_v8")
     async def att_p(self, interaction, button): await self._log(interaction, "代理")
-
     @discord.ui.button(label="終了", style=discord.ButtonStyle.secondary, custom_id="att_e_v8")
     async def att_e(self, interaction, button): await self._log(interaction, "終了")
 
@@ -133,34 +153,9 @@ async def on_ready():
     print(f"✅ Bot Online: {bot.user}")
 
 @bot.command()
-async def sync(ctx):
-    """個別コマンド: !sync で即座に同期"""
-    res = await core_sync_logic(ctx.author, ctx.guild)
-    await ctx.send(res)
-
-@bot.command()
 @commands.has_permissions(administrator=True)
 async def panel(ctx):
-    await ctx.send("**【総合パネル】**", view=MultiFunctionView())
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def report(ctx):
-    all_orgs = fetch_all_orgs()
-    org_map = {o.org_name.lower(): o.org_name for o in all_orgs}
-    for o in all_orgs:
-        if o.alias: org_map[o.alias.lower()] = o.org_name
-    present = set(); details = []
-    for m in ctx.guild.members:
-        if m.voice:
-            match = re.search(r'[@＠](.+)$', m.display_name)
-            oname = org_map.get(match.group(1).strip().lower()) if match else None
-            if oname: present.add(oname); details.append(f"🔵 {oname} | {m.display_name}")
-    absent = [o.org_name for o in all_orgs if o.org_name not in present]
-    res = f"**【📊 出席照合】**\n参加: {len(present)} / 未着: {len(absent)}\n\n"
-    res += "**▼ VC参加中**\n" + ("\n".join(details) if details else "なし") + "\n\n"
-    res += "**▼ 未参加**\n" + ("\n".join([f"❌ {o}" for o in absent]) if absent else "全団体出席中！")
-    await ctx.send(res)
+    await ctx.send("**【文化Bot 一括管理パネル】**\n⚠️ 「全員一括同期」は管理者が全メンバーをスキャンします。", view=MultiFunctionView())
 
 @bot.command()
 @commands.has_permissions(administrator=True)
