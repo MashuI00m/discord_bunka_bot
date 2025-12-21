@@ -9,7 +9,7 @@ import requests
 import time
 import datetime
 
-# --- SQLAlchemy 設定 ---
+# --- SQLAlchemy 完全再構築 ---
 from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Integer
 from sqlalchemy.orm import sessionmaker, declarative_base
 
@@ -20,158 +20,147 @@ if not DATABASE_URL:
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+# 接続設定の最適化
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 Session = sessionmaker(bind=engine)
 Base = declarative_base()
 
-class OrgSettings(Base):
-    __tablename__ = 'org_settings'
+# --- 新設計のテーブル (v3) ---
+class MasterOrg(Base):
+    """団体マスタ: 全サーバー共通の団体リスト"""
+    __tablename__ = 'master_org_v3'
     id = Column(Integer, primary_key=True, autoincrement=True)
-    org_name = Column(String)
-    alias = Column(String, nullable=True)
-    exclude_leader = Column(Boolean, default=False)
+    org_name = Column(String, unique=True, nullable=False) # 団体名
+    alias = Column(String, index=True)                     # 略称
+    exclude_leader = Column(Boolean, default=False)       # 部長ロールを付与しない団体か
 
-class Attendance(Base):
-    __tablename__ = 'attendance'
+class AttendanceLog(Base):
+    """出席ログ: 誰がいつ参加したかの記録"""
+    __tablename__ = 'attendance_log_v3'
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String)
+    user_id = Column(String, nullable=False)
+    user_name = Column(String)
     org_name = Column(String)
     is_proxy = Column(Boolean)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
 
+# テーブルをゼロから作成（存在しない場合のみ）
 Base.metadata.create_all(engine)
 
-# --- 定数 ---
-SHARED_CATEGORY_NAME = '団体用'
+# --- 定数設定 ---
+CATEGORY_NAME = '団体用'
 LEADER_ROLE_NAME = '部長'
 
 # --- 共通関数 ---
-def get_allowed_orgs_map():
+def fetch_org_map():
     session = Session()
     try:
-        org_map = {}
-        for org in session.query(OrgSettings).all():
-            org_map[org.org_name.lower()] = org
-            if org.alias: org_map[org.alias.lower()] = org
-        return org_map
-    finally: session.close()
+        orgs = session.query(MasterOrg).all()
+        # 団体名と略称の両方から検索できるようにマッピング
+        mapping = {o.org_name.lower(): o for o in orgs}
+        for o in orgs:
+            if o.alias:
+                mapping[o.alias.lower()] = o
+        return mapping
+    finally:
+        session.close()
 
 # --- UI Views ---
 
-class RoleCheckView(discord.ui.View):
-    def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label="ロール・個室を自動取得", style=discord.ButtonStyle.green, custom_id="role_check_v12")
-    async def sync(self, interaction: discord.Interaction, button: discord.ui.Button):
+class RoleSyncView(discord.ui.View):
+    """所属確認パネルのボタン処理"""
+    def __init__(self):
+        super().__init__(timeout=None)
+    
+    @discord.ui.button(label="ロール・個室を同期", style=discord.ButtonStyle.green, custom_id="sync_v3")
+    async def sync_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        user, guild = interaction.user, interaction.guild
-        org_map = get_allowed_orgs_map()
+        user = interaction.user
+        guild = interaction.guild
         
+        # ニックネームから「@団体名」を抽出
         match = re.search(r'[@＠](.+)$', user.display_name)
-        if not match: return await interaction.followup.send("⚠️ 名前を「名前@団体名」にしてください。")
+        if not match:
+            return await interaction.followup.send("⚠️ ニックネームを「名前@団体名」に変更してから押してください。", ephemeral=True)
         
         org_key = match.group(1).strip().lower()
+        org_map = fetch_org_map()
         org_data = org_map.get(org_key)
-        if not org_data: return await interaction.followup.send(f"🚫 「{org_key}」は未登録です。")
         
-        # 1. 団体ロール付与
-        role_name = org_data.org_name
-        role = discord.utils.get(guild.roles, name=role_name) or await guild.create_role(name=role_name, mentionable=True)
-        await user.add_roles(role)
+        if not org_data:
+            return await interaction.followup.send(f"🚫 「{org_key}」は団体リストに登録されていません。", ephemeral=True)
+
+        # 1. 団体ロールの作成・付与
+        target_org_name = org_data.org_name
+        org_role = discord.utils.get(guild.roles, name=target_org_name) or await guild.create_role(name=target_org_name, mentionable=True)
+        await user.add_roles(org_role)
         
-        # 2. 部長判定
+        # 2. 部長ロールの判定 (代理がいなくて、かつ除外団体でなければ付与)
         is_proxy = "代理" in user.display_name
         leader_role = discord.utils.get(guild.roles, name=LEADER_ROLE_NAME) or await guild.create_role(name=LEADER_ROLE_NAME)
         
         if not org_data.exclude_leader and not is_proxy:
             await user.add_roles(leader_role)
-            leader_msg = f" ＆ {LEADER_ROLE_NAME}"
+            result_msg = f"✅ 「{target_org_name}」と「{LEADER_ROLE_NAME}」を付与しました。"
         else:
-            if leader_role in user.roles: await user.remove_roles(leader_role)
-            leader_msg = ""
+            if leader_role in user.roles:
+                await user.remove_roles(leader_role)
+            result_msg = f"✅ 「{target_org_name}」を付与しました（部長ロール対象外）。"
 
-        # 3. チャンネル作成
-        category = discord.utils.get(guild.categories, name=SHARED_CATEGORY_NAME)
+        # 3. チャンネルの自動作成
+        category = discord.utils.get(guild.categories, name=CATEGORY_NAME)
         if category:
-            ch_name = role_name.lower().replace(" ", "-")
-            overwrites = {guild.default_role: discord.PermissionOverwrite(read_messages=False),
-                          role: discord.PermissionOverwrite(read_messages=True),
-                          guild.me: discord.PermissionOverwrite(read_messages=True)}
+            ch_name = target_org_name.lower().replace(" ", "-")
             if not any(ch_name in c.name.lower() for c in category.text_channels):
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                    org_role: discord.PermissionOverwrite(read_messages=True),
+                    guild.me: discord.PermissionOverwrite(read_messages=True)
+                }
                 await guild.create_text_channel(ch_name, category=category, overwrites=overwrites)
         
-        await interaction.followup.send(f"✅ 「{role_name}{leader_msg}」を同期完了！")
+        await interaction.followup.send(result_msg, ephemeral=True)
 
-class AttendanceView(discord.ui.View):
-    def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label="通常参加", style=discord.ButtonStyle.green, custom_id="att_reg_v12")
-    async def reg(self, interaction, button): await self._process(interaction, False)
-    @discord.ui.button(label="代理参加", style=discord.ButtonStyle.red, custom_id="att_prx_v12")
-    async def prx(self, interaction, button): await self._process(interaction, True)
-    @discord.ui.button(label="🔊 通話中レポート", style=discord.ButtonStyle.blurple, custom_id="att_vc_v12")
-    async def vc(self, interaction, button):
-        if not interaction.user.guild_permissions.administrator: return await interaction.response.send_message("❌ 管理者のみ", ephemeral=True)
-        await interaction.response.defer()
-        org_map = get_allowed_orgs_map()
-        v_list = [f"{org_map.get(re.search(r'[@＠](.+)$', m.display_name).group(1).strip().lower(), type('O',(),{'org_name':'不明'})).org_name if re.search(r'[@＠](.+)$', m.display_name) else '不明'} | {m.display_name} | {m.voice.channel.name}" for m in interaction.guild.members if m.voice]
-        await interaction.followup.send("🔊 通話中:\n```\n" + ("\n".join(v_list) if v_list else "なし") + "\n```")
+# --- Bot コマンド ---
 
-    async def _process(self, interaction, is_proxy):
-        await interaction.response.defer(ephemeral=True)
-        match = re.search(r'[@＠](.+)$', interaction.user.display_name)
-        if not match: return await interaction.followup.send("⚠️ 名前修正をしてください。")
-        org_data = get_allowed_orgs_map().get(match.group(1).strip().lower())
-        if not org_data: return await interaction.followup.send("🚫 未登録です。")
-        session = Session()
-        session.add(Attendance(user_id=str(interaction.user.id), org_name=org_data.org_name, is_proxy=is_proxy))
-        session.commit(); session.close()
-        await interaction.followup.send("✅ 出席を記録しました。")
-
-# --- Bot 本体 ---
-intents = discord.Intents.default()
-intents.members = intents.message_content = True
+intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
-    bot.add_view(RoleCheckView())
-    bot.add_view(AttendanceView())
-    print(f"✅ Logged in as {bot.user}")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def panel(ctx): await ctx.send("【所属確認】", view=RoleCheckView())
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def attend_panel(ctx): await ctx.send("【出席記録】", view=AttendanceView())
+    bot.add_view(RoleSyncView())
+    print(f"✅ Bot Online: {bot.user}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def add_org(ctx, name: str, alias: str = None, exclude: bool = False):
+    """!add_org 団体名 [略称] [True/False]"""
     session = Session()
     try:
-        session.add(OrgSettings(org_name=name, alias=alias, exclude_leader=exclude))
+        new_org = MasterOrg(org_name=name, alias=alias, exclude_leader=exclude)
+        session.add(new_org)
         session.commit()
-        await ctx.send(f"✅ {name} を登録しました。")
-    except: await ctx.send("❌ 登録失敗。")
-    finally: session.close()
+        await ctx.send(f"✅ 団体「{name}」をDBに新規登録しました。")
+    except Exception as e:
+        session.rollback()
+        await ctx.send(f"❌ 登録失敗: その団体名は既に存在するか、DBエラーです。")
+    finally:
+        session.close()
 
-# --- インフラ維持 ---
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def panel(ctx):
+    """認証パネルを設置"""
+    await ctx.send(f"**【所属・個室同期パネル】**\n名前を「@団体名」に変えてから下のボタンを押してください。", view=RoleSyncView())
+
+# --- インフラ維持 (Render用) ---
 app = Flask(__name__)
 @app.route('/')
-def h(): return "ok"
-def run_flask(): app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
-def ping():
-    time.sleep(20)
-    while True:
-        try:
-            url = os.environ.get("RENDER_EXTERNAL_URL")
-            if url: requests.get(url)
-            s = Session(); s.query(OrgSettings).first(); s.close()
-        except: pass
-        time.sleep(300)
+def health(): return "Ready"
+
+def run_flask():
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    threading.Thread(target=ping, daemon=True).start()
     bot.run(os.environ.get("DISCORD_TOKEN"))
