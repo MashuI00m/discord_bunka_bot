@@ -36,6 +36,7 @@ class ServerConfig(Base):
     proxy_role_name = Column(String, default="代理")
 
 class AttendanceLog(Base):
+    """出席ログ"""
     __tablename__ = 'attendance_log_v10'
     id = Column(Integer, primary_key=True, autoincrement=True)
     guild_id = Column(String)
@@ -77,21 +78,30 @@ async def core_sync_logic(user, guild, all_orgs):
 
     conf = get_config(guild.id)
     
+    # 役職名が「なし」の場合はスキップ判定用
+    skip_keywords = ["なし", "None", "none", "ナシ"]
+    l_role_name = None if conf.leader_role_name in skip_keywords else conf.leader_role_name
+    p_role_name = None if conf.proxy_role_name in skip_keywords else conf.proxy_role_name
+
     # お掃除
     all_org_names = [o.org_name for o in all_orgs]
-    cleanup_list = all_org_names + [conf.leader_role_name, conf.proxy_role_name]
+    cleanup_list = all_org_names.copy()
+    if l_role_name: cleanup_list.append(l_role_name)
+    if p_role_name: cleanup_list.append(p_role_name)
+    
     roles_to_remove = [r for r in user.roles if r.name in cleanup_list and r.name != target_org.org_name]
     if roles_to_remove: await user.remove_roles(*roles_to_remove)
 
-    # 付与
+    # 団体ロール付与
     o_role = discord.utils.get(guild.roles, name=target_org.org_name) or await guild.create_role(name=target_org.org_name, mentionable=True)
-    l_role = discord.utils.get(guild.roles, name=conf.leader_role_name) or await guild.create_role(name=conf.leader_role_name)
-    p_role = discord.utils.get(guild.roles, name=conf.proxy_role_name) or await guild.create_role(name=conf.proxy_role_name)
-
     await user.add_roles(o_role)
-    if conf.proxy_role_name in user.display_name or "代理" in user.display_name:
+
+    # 役職付与 (設定が「なし」でない場合のみ)
+    if p_role_name and (p_role_name in user.display_name or "代理" in user.display_name):
+        p_role = discord.utils.get(guild.roles, name=p_role_name) or await guild.create_role(name=p_role_name)
         await user.add_roles(p_role)
-    elif not target_org.exclude_leader:
+    elif l_role_name and not target_org.exclude_leader:
+        l_role = discord.utils.get(guild.roles, name=l_role_name) or await guild.create_role(name=l_role_name)
         await user.add_roles(l_role)
 
     # 部屋
@@ -109,23 +119,23 @@ async def core_sync_logic(user, guild, all_orgs):
 class MultiFunctionView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
 
-    @discord.ui.button(label="全員一括同期", style=discord.ButtonStyle.danger, custom_id="sync_all_v10")
+    @discord.ui.button(label="全員一括同期", style=discord.ButtonStyle.danger, custom_id="sync_all_v11")
     async def sync_all(self, interaction, button):
         if not interaction.user.guild_permissions.administrator: return
-        await interaction.response.send_message("🔄 一括同期中...", ephemeral=True)
+        await interaction.response.send_message("🔄 一括同期を開始します...", ephemeral=True)
         all_orgs = fetch_all_orgs()
         count = 0
         async for m in interaction.guild.fetch_members(limit=None):
             res = await core_sync_logic(m, interaction.guild, all_orgs)
             if res and "✅" in res: count += 1
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.4)
         await interaction.followup.send(f"📊 同期完了: {count}名")
 
-    @discord.ui.button(label="通常出席", style=discord.ButtonStyle.primary, custom_id="att_n_v10")
+    @discord.ui.button(label="通常出席", style=discord.ButtonStyle.primary, custom_id="att_n_v11")
     async def att_n(self, interaction, button): await self._log(interaction, "通常")
-    @discord.ui.button(label="代理出席", style=discord.ButtonStyle.danger, custom_id="att_p_v10")
+    @discord.ui.button(label="代理出席", style=discord.ButtonStyle.danger, custom_id="att_p_v11")
     async def att_p(self, interaction, button): await self._log(interaction, "代理")
-    @discord.ui.button(label="終了", style=discord.ButtonStyle.secondary, custom_id="att_e_v10")
+    @discord.ui.button(label="終了", style=discord.ButtonStyle.secondary, custom_id="att_e_v11")
     async def att_e(self, interaction, button): await self._log(interaction, "終了")
 
     async def _log(self, interaction, status):
@@ -153,7 +163,7 @@ async def on_ready():
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def set_config(ctx, category: str = "団体用", leader: str = "部長", proxy: str = "代理"):
-    """サーバー設定: !set_config カテゴリ名 部長ロール名 代理ロール名"""
+    """サーバー設定: !set_config カテゴリ名 部長ロール名(なし可) 代理ロール名(なし可)"""
     s = Session()
     conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first()
     if not conf: conf = ServerConfig(guild_id=str(ctx.guild.id))
@@ -163,20 +173,32 @@ async def set_config(ctx, category: str = "団体用", leader: str = "部長", p
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def add_org(ctx, name: str, alias: str = None, exclude: bool = False):
+async def add_orgs(ctx, *, data: str):
+    """一括登録: !add_orgs (改行区切り)"""
     s = Session()
-    try:
-        s.add(MasterOrg(org_name=name, alias=alias, exclude_leader=exclude))
-        s.commit(); await ctx.send(f"✅ 共通DBに「{name}」を追加。")
-    except: await ctx.send("❌ 重複エラー。")
-    finally: s.close()
+    lines = data.strip().split('\n')
+    success, error = [], []
+    for line in lines:
+        parts = line.split()
+        if not parts: continue
+        name = parts[0]
+        alias = parts[1] if len(parts) > 1 else None
+        exclude = parts[2].lower() == 'true' if len(parts) > 2 else False
+        try:
+            s.add(MasterOrg(org_name=name, alias=alias, exclude_leader=exclude))
+            s.commit()
+            success.append(name)
+        except:
+            s.rollback(); error.append(name)
+    s.close()
+    await ctx.send(f"✅ 登録成功: {', '.join(success) if success else 'なし'}\n❌ 失敗: {', '.join(error) if error else 'なし'}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def panel(ctx):
-    await ctx.send(f"**【{ctx.guild.name} 管理パネル】**", view=MultiFunctionView())
+    await ctx.send(f"**【{ctx.guild.name} 統合管理パネル】**", view=MultiFunctionView())
 
-# --- Flask ---
+# --- Flask & Run ---
 app = Flask(__name__)
 @app.route('/')
 def h(): return "OK"
