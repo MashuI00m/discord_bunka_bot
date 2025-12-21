@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 import datetime
 import asyncio
 
-# --- DB設定 (v14) ---
+# --- DB設定 (v15) ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -19,14 +19,14 @@ Session = sessionmaker(bind=engine)
 Base = declarative_base()
 
 class MasterOrg(Base):
-    __tablename__ = 'master_org_v14'
+    __tablename__ = 'master_org_v15'
     id = Column(Integer, primary_key=True, autoincrement=True)
     org_name = Column(String, unique=True, nullable=False)
     alias = Column(String, index=True)
     exclude_leader = Column(Boolean, default=False)
 
 class ServerConfig(Base):
-    __tablename__ = 'server_config_v14'
+    __tablename__ = 'server_config_v15'
     guild_id = Column(String, primary_key=True)
     category_name = Column(String, default="団体用")
     leader_role_name = Column(String, default="部長")
@@ -35,7 +35,8 @@ class ServerConfig(Base):
     target_vc_name = Column(String, default=None)
 
 class AttendanceLog(Base):
-    __tablename__ = 'attendance_log_v14'
+    """出席ボタン押下ログ"""
+    __tablename__ = 'attendance_log_v15'
     id = Column(Integer, primary_key=True, autoincrement=True)
     guild_id = Column(String)
     user_id = Column(String)
@@ -45,13 +46,15 @@ class AttendanceLog(Base):
     timestamp = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))))
 
 class VCState(Base):
-    __tablename__ = 'vc_state_v14'
+    """VC滞在履歴ログ（消えずに残る）"""
+    __tablename__ = 'vc_history_v15'
     id = Column(Integer, primary_key=True, autoincrement=True)
     guild_id = Column(String)
     user_id = Column(String)
     user_name = Column(String)
     channel_name = Column(String)
     joined_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))))
+    left_at = Column(DateTime, nullable=True) # 退出時にここを埋める
 
 Base.metadata.create_all(engine)
 
@@ -62,31 +65,24 @@ def get_config(guild_id):
         conf = session.query(ServerConfig).filter_by(guild_id=str(guild_id)).first()
         if not conf:
             conf = ServerConfig(guild_id=str(guild_id))
-            session.add(conf)
-            session.commit()
-            session.refresh(conf)
+            session.add(conf); session.commit(); session.refresh(conf)
         return conf
-    finally:
-        session.close()
+    finally: session.close()
 
 def fetch_all_orgs():
     session = Session()
-    try:
-        return session.query(MasterOrg).all()
-    finally:
-        session.close()
+    try: return session.query(MasterOrg).all()
+    finally: session.close()
 
-# --- 同期コアロジック ---
+# --- 同期ロジック (省略せず保持) ---
 async def core_sync_logic(user, guild, all_orgs):
     if user.bot: return None
     match = re.search(r'[@＠](.+)$', user.display_name)
     if not match: return f"⚠️ {user.display_name}: 形式不備"
-    
     org_key = match.group(1).strip().lower()
     org_map = {o.org_name.lower(): o for o in all_orgs}
     for o in all_orgs:
         if o.alias: org_map[o.alias.lower()] = o
-    
     target_org = org_map.get(org_key)
     if not target_org: return f"🚫 {user.display_name}: 「{org_key}」未登録"
 
@@ -123,77 +119,65 @@ async def core_sync_logic(user, guild, all_orgs):
     else: await chan.edit(overwrites=overwrites)
     return f"✅ {user.display_name} 同期完了"
 
-# --- UI ---
-class MultiFunctionView(discord.ui.View):
-    def __init__(self): super().__init__(timeout=None)
-
-    @discord.ui.button(label="全員一括同期", style=discord.ButtonStyle.danger, custom_id="sync_all_v14")
-    async def sync_all(self, interaction, button):
-        if not interaction.user.guild_permissions.administrator: return
-        await interaction.response.send_message("🔄 一括同期を開始...", ephemeral=True)
-        all_orgs = fetch_all_orgs()
-        count = 0
-        async for m in interaction.guild.fetch_members(limit=None):
-            res = await core_sync_logic(m, interaction.guild, all_orgs)
-            if res and "✅" in res: count += 1
-            await asyncio.sleep(0.4)
-        await interaction.followup.send(f"📊 同期完了: {count}名")
-
-    @discord.ui.button(label="通常出席", style=discord.ButtonStyle.primary, custom_id="att_n_v14")
-    async def att_n(self, interaction, button): await self._log(interaction, "通常")
-    @discord.ui.button(label="代理出席", style=discord.ButtonStyle.danger, custom_id="att_p_v14")
-    async def att_p(self, interaction, button): await self._log(interaction, "代理")
-    @discord.ui.button(label="終了", style=discord.ButtonStyle.secondary, custom_id="att_e_v14")
-    async def att_e(self, interaction, button): await self._log(interaction, "終了")
-
-    async def _log(self, interaction, status):
-        await interaction.response.defer(ephemeral=True)
-        match = re.search(r'[@＠](.+)$', interaction.user.display_name)
-        if not match: return await interaction.followup.send("⚠️ @団体名 が必要です。")
-        all_orgs = fetch_all_orgs()
-        oname = next((o.org_name for o in all_orgs if o.org_name.lower() == match.group(1).strip().lower() or (o.alias and o.alias.lower() == match.group(1).strip().lower())), None)
-        if not oname: return await interaction.followup.send("🚫 未登録です。")
-        
-        s = Session()
-        try:
-            s.add(AttendanceLog(guild_id=str(interaction.guild.id), user_id=str(interaction.user.id), user_name=interaction.user.display_name, org_name=oname, status=status))
-            s.commit()
-        finally:
-            s.close()
-        await interaction.followup.send(f"✅ {oname} 【{status}】を記録。")
-
-# --- Bot ---
+# --- Bot本体 ---
 bot = commands.Bot(command_prefix='!', intents=discord.Intents.all())
 
 @bot.event
 async def on_ready():
     bot.add_view(MultiFunctionView())
     print(f"✅ Bot Online: {bot.user}")
-    for guild in bot.guilds:
-        conf = get_config(guild.id)
-        channel = discord.utils.get(guild.text_channels, name=conf.admin_log_channel)
-        if channel:
-            async for m in channel.history(limit=10):
-                if m.author == bot.user and "統合管理パネル" in m.content: await m.delete()
-            await channel.send(f"**【{guild.name} 統合管理パネル】**\n（監視VC: {conf.target_vc_name or '未設定'}）", view=MultiFunctionView())
 
 @bot.event
 async def on_voice_state_update(member, before, after):
+    """VC入退室を『履歴』として保存"""
     if member.bot: return
     conf = get_config(member.guild.id)
     if not conf.target_vc_name: return
     
     s = Session()
     try:
+        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+        # 入室: 指定のVCに入った
         if after.channel and after.channel.name == conf.target_vc_name:
+            # もし未終了の履歴があれば閉じる(異常系対策)
+            s.query(VCState).filter_by(user_id=str(member.id), guild_id=str(member.guild.id), left_at=None).update({VCState.left_at: now})
             s.add(VCState(guild_id=str(member.guild.id), user_id=str(member.id), user_name=member.display_name, channel_name=after.channel.name))
+        
+        # 退出: 指定のVCから出た(あるいは移動した)
         if before.channel and before.channel.name == conf.target_vc_name:
             if not after.channel or after.channel.name != conf.target_vc_name:
-                s.query(VCState).filter_by(user_id=str(member.id), guild_id=str(member.guild.id)).delete()
+                record = s.query(VCState).filter_by(user_id=str(member.id), guild_id=str(member.guild.id), left_at=None).first()
+                if record: record.left_at = now
         s.commit()
-    finally:
-        s.close()
+    finally: s.close()
 
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def report(ctx):
+    """【照合】本日VC履歴がある人と出席ボタン押下者を比較"""
+    conf = get_config(ctx.guild.id)
+    if not conf.target_vc_name: return await ctx.send("⚠️ `!set_vc` を設定してください。")
+    
+    s = Session()
+    try:
+        today_start = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).replace(hour=0, minute=0, second=0, microsecond=0)
+        # 本日、一度でも監視VCに入った人
+        vc_history = s.query(VCState).filter(VCState.guild_id == str(ctx.guild.id), VCState.joined_at >= today_start).all()
+        # 本日、出席ボタンを押した人
+        pushed = s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(ctx.guild.id), AttendanceLog.timestamp >= today_start, AttendanceLog.status.in_(["通常", "代理"])).all()
+        
+        v_ids = {u.user_id: u.user_name for u in vc_history}
+        p_ids = {u.user_id: u.user_name for u in pushed}
+        
+        msg = f"📊 **本日の出欠照合レポート** ({conf.target_vc_name})\n"
+        msg += "---\n⚠️ **VC履歴はあるが、ボタン未押下:**\n"
+        msg += (', '.join([name for uid, name in v_ids.items() if uid not in p_ids]) or "なし")
+        msg += "\n\n❓ **ボタンは押したが、VC履歴なし:**\n"
+        msg += (', '.join([name for uid, name in p_ids.items() if uid not in v_ids]) or "なし")
+        await ctx.send(msg)
+    finally: s.close()
+
+# --- 他の管理コマンド ---
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def set_config(ctx, category: str = "団体用", leader: str = "部長", proxy: str = "代理", log_channel: str = "管理ログ"):
@@ -202,11 +186,8 @@ async def set_config(ctx, category: str = "団体用", leader: str = "部長", p
         conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first()
         if not conf: conf = ServerConfig(guild_id=str(ctx.guild.id))
         conf.category_name, conf.leader_role_name, conf.proxy_role_name, conf.admin_log_channel = category, leader, proxy, log_channel
-        s.add(conf)
-        s.commit()
-        await ctx.send("✅ 基本設定を更新しました。")
-    finally:
-        s.close()
+        s.add(conf); s.commit(); await ctx.send("✅ 基本設定を更新。")
+    finally: s.close()
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -215,69 +196,67 @@ async def set_vc(ctx, name: str):
     try:
         conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first()
         if not conf: conf = ServerConfig(guild_id=str(ctx.guild.id))
-        conf.target_vc_name = name
-        s.add(conf)
-        s.commit()
-        await ctx.send(f"✅ 監視VCを「{name}」に設定。")
-    finally:
-        s.close()
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def report(ctx):
-    conf = get_config(ctx.guild.id)
-    if not conf.target_vc_name: return await ctx.send("⚠️ `!set_vc` で監視VCを指定してください。")
-    
-    s = Session()
-    try:
-        vc_users = s.query(VCState).filter_by(guild_id=str(ctx.guild.id)).all()
-        limit = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))) - datetime.timedelta(hours=2)
-        pushed = s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(ctx.guild.id), AttendanceLog.timestamp >= limit, AttendanceLog.status.in_(["通常", "代理"])).all()
-        
-        p_ids = {u.user_id for u in pushed}
-        v_ids = {u.user_id for u in vc_users}
-        
-        msg = f"📊 **出欠照合** ({conf.target_vc_name})\n---\n⚠️ **VCにいるが未押下**:\n"
-        msg += (', '.join([u.user_name for u in vc_users if u.user_id not in p_ids]) or "なし") + "\n\n❓ **押下したがVC不在**:\n"
-        msg += (', '.join(list({u.user_name for u in pushed if u.user_id not in v_ids})) or "なし")
-        await ctx.send(msg)
-    finally:
-        s.close()
+        conf.target_vc_name = name; s.add(conf); s.commit(); await ctx.send(f"✅ 監視対象VCを「{name}」に設定。")
+    finally: s.close()
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def add_orgs(ctx, *, data: str):
     s = Session()
     try:
-        lines = data.strip().split('\n')
-        success, error = [], []
+        lines = data.strip().split('\n'); success = []
         for line in lines:
             parts = line.split()
             if not parts: continue
-            name = parts[0]
-            alias = parts[1] if len(parts) > 1 else None
-            exclude = parts[2].lower() == 'true' if len(parts) > 2 else False
             try:
-                s.add(MasterOrg(org_name=name, alias=alias, exclude_leader=exclude))
-                s.commit()
-                success.append(name)
-            except:
-                s.rollback()
-                error.append(name)
-        await ctx.send(f"✅ 登録成功: {', '.join(success)}")
-    finally:
-        s.close()
+                s.add(MasterOrg(org_name=parts[0], alias=parts[1] if len(parts)>1 else None, exclude_leader=parts[2].lower()=='true' if len(parts)>2 else False))
+                s.commit(); success.append(parts[0])
+            except: s.rollback()
+        await ctx.send(f"✅ 登録完了: {', '.join(success)}")
+    finally: s.close()
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def panel(ctx):
     await ctx.send(f"**【{ctx.guild.name} 統合管理パネル】**", view=MultiFunctionView())
 
-# --- Flask ---
-app = Flask(__name__)
-@app.route('/')
-def h(): return "OK"
+# --- UIクラス ---
+class MultiFunctionView(discord.ui.View):
+    def __init__(self): super().__init__(timeout=None)
+    @discord.ui.button(label="全員一括同期", style=discord.ButtonStyle.danger, custom_id="sync_all_v15")
+    async def sync_all(self, interaction, button):
+        if not interaction.user.guild_permissions.administrator: return
+        await interaction.response.send_message("🔄 一括同期開始...", ephemeral=True)
+        all_orgs = fetch_all_orgs(); count = 0
+        async for m in interaction.guild.fetch_members(limit=None):
+            res = await core_sync_logic(m, interaction.guild, all_orgs)
+            if res and "✅" in res: count += 1
+        await interaction.followup.send(f"📊 同期完了: {count}名")
 
+    @discord.ui.button(label="通常出席", style=discord.ButtonStyle.primary, custom_id="att_n_v15")
+    async def att_n(self, interaction, button): await self._log(interaction, "通常")
+    @discord.ui.button(label="代理出席", style=discord.ButtonStyle.danger, custom_id="att_p_v15")
+    async def att_p(self, interaction, button): await self._log(interaction, "代理")
+    @discord.ui.button(label="終了", style=discord.ButtonStyle.secondary, custom_id="att_e_v15")
+    async def att_e(self, interaction, button): await self._log(interaction, "終了")
+
+    async def _log(self, interaction, status):
+        await interaction.response.defer(ephemeral=True)
+        match = re.search(r'[@＠](.+)$', interaction.user.display_name)
+        if not match: return await interaction.followup.send("⚠️ @団体名 が必要。")
+        all_orgs = fetch_all_orgs()
+        oname = next((o.org_name for o in all_orgs if o.org_name.lower() == match.group(1).strip().lower() or (o.alias and o.alias.lower() == match.group(1).strip().lower())), None)
+        if not oname: return await interaction.followup.send("🚫 未登録。")
+        s = Session()
+        try:
+            s.add(AttendanceLog(guild_id=str(interaction.guild.id), user_id=str(interaction.user.id), user_name=interaction.user.display_name, org_name=oname, status=status))
+            s.commit()
+        finally: s.close()
+        await interaction.followup.send(f"✅ {oname} 【{status}】を記録。")
+
+# --- Flask & Run ---
+app = Flask(__name__); @app.route('/')
+def h(): return "OK"
 if __name__ == "__main__":
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000))), daemon=True).start()
     bot.run(os.environ.get("DISCORD_TOKEN"))
