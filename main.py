@@ -20,7 +20,6 @@ Session = sessionmaker(bind=engine)
 Base = declarative_base()
 
 class MasterOrg(Base):
-    """団体マスタ: 全サーバー共通"""
     __tablename__ = 'master_org_v10'
     id = Column(Integer, primary_key=True, autoincrement=True)
     org_name = Column(String, unique=True, nullable=False)
@@ -28,15 +27,14 @@ class MasterOrg(Base):
     exclude_leader = Column(Boolean, default=False)
 
 class ServerConfig(Base):
-    """サーバー個別設定: サーバーごとに保持"""
     __tablename__ = 'server_config_v10'
     guild_id = Column(String, primary_key=True)
     category_name = Column(String, default="団体用")
     leader_role_name = Column(String, default="部長")
     proxy_role_name = Column(String, default="代理")
+    admin_log_channel = Column(String, default="管理ログ") # 追記: ログチャンネル名
 
 class AttendanceLog(Base):
-    """出席ログ"""
     __tablename__ = 'attendance_log_v10'
     id = Column(Integer, primary_key=True, autoincrement=True)
     guild_id = Column(String)
@@ -77,13 +75,10 @@ async def core_sync_logic(user, guild, all_orgs):
     if not target_org: return f"🚫 {user.display_name}: 「{org_key}」未登録"
 
     conf = get_config(guild.id)
-    
-    # 役職名が「なし」の場合はスキップ判定用
     skip_keywords = ["なし", "None", "none", "ナシ"]
     l_role_name = None if conf.leader_role_name in skip_keywords else conf.leader_role_name
     p_role_name = None if conf.proxy_role_name in skip_keywords else conf.proxy_role_name
 
-    # お掃除
     all_org_names = [o.org_name for o in all_orgs]
     cleanup_list = all_org_names.copy()
     if l_role_name: cleanup_list.append(l_role_name)
@@ -92,11 +87,9 @@ async def core_sync_logic(user, guild, all_orgs):
     roles_to_remove = [r for r in user.roles if r.name in cleanup_list and r.name != target_org.org_name]
     if roles_to_remove: await user.remove_roles(*roles_to_remove)
 
-    # 団体ロール付与
     o_role = discord.utils.get(guild.roles, name=target_org.org_name) or await guild.create_role(name=target_org.org_name, mentionable=True)
     await user.add_roles(o_role)
 
-    # 役職付与 (設定が「なし」でない場合のみ)
     if p_role_name and (p_role_name in user.display_name or "代理" in user.display_name):
         p_role = discord.utils.get(guild.roles, name=p_role_name) or await guild.create_role(name=p_role_name)
         await user.add_roles(p_role)
@@ -104,7 +97,6 @@ async def core_sync_logic(user, guild, all_orgs):
         l_role = discord.utils.get(guild.roles, name=l_role_name) or await guild.create_role(name=l_role_name)
         await user.add_roles(l_role)
 
-    # 部屋
     cat = discord.utils.get(guild.categories, name=conf.category_name) or await guild.create_category(conf.category_name)
     ch_name = target_org.org_name.lower().replace(" ", "-")
     chan = next((c for c in cat.text_channels if ch_name in c.name.lower()), None)
@@ -159,17 +151,33 @@ bot = commands.Bot(command_prefix='!', intents=discord.Intents.all())
 async def on_ready():
     bot.add_view(MultiFunctionView())
     print(f"✅ Bot Online: {bot.user}")
+    
+    # 起動時に各サーバーの「管理ログ」チャンネルへパネルを自動投稿
+    for guild in bot.guilds:
+        conf = get_config(guild.id)
+        channel = discord.utils.get(guild.text_channels, name=conf.admin_log_channel)
+        if channel:
+            # 過去のBotメッセージを掃除（重複防止）
+            async for message in channel.history(limit=20):
+                if message.author == bot.user and "統合管理パネル" in message.content:
+                    await message.delete()
+            
+            await channel.send(f"**【{guild.name} 統合管理パネル】**\n（Bot起動時に自動更新されました）", view=MultiFunctionView())
+            print(f"📡 Auto-posted panel to {guild.name} > #{conf.admin_log_channel}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def set_config(ctx, category: str = "団体用", leader: str = "部長", proxy: str = "代理"):
-    """サーバー設定: !set_config カテゴリ名 部長ロール名(なし可) 代理ロール名(なし可)"""
+async def set_config(ctx, category: str = "団体用", leader: str = "部長", proxy: str = "代理", log_channel: str = "管理ログ"):
+    """サーバー設定: !set_config カテゴリ名 部長ロール名 代理ロール名 ログチャンネル名"""
     s = Session()
     conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first()
     if not conf: conf = ServerConfig(guild_id=str(ctx.guild.id))
-    conf.category_name, conf.leader_role_name, conf.proxy_role_name = category, leader, proxy
+    conf.category_name = category
+    conf.leader_role_name = leader
+    conf.proxy_role_name = proxy
+    conf.admin_log_channel = log_channel
     s.add(conf); s.commit(); s.close()
-    await ctx.send(f"✅ 設定更新: カテゴリ={category}, 部長={leader}, 代理={proxy}")
+    await ctx.send(f"✅ 設定更新: カテゴリ={category}, 部長={leader}, 代理={proxy}, ログ窓=#{log_channel}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
