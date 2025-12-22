@@ -16,12 +16,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(
-    DATABASE_URL, 
-    pool_pre_ping=True, 
-    pool_recycle=300,
-    connect_args={'sslmode':'require'}
-)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300, connect_args={'sslmode':'require'})
 Session = sessionmaker(bind=engine)
 Base = declarative_base()
 
@@ -64,212 +59,177 @@ class VCState(Base):
 
 Base.metadata.create_all(engine)
 
-# --- 共通関数 ---
 def get_config(guild_id):
     session = Session()
     try:
         conf = session.query(ServerConfig).filter_by(guild_id=str(guild_id)).first()
         if not conf:
             conf = ServerConfig(guild_id=str(guild_id))
-            session.add(conf)
-            session.commit()
-            session.refresh(conf)
+            session.add(conf); session.commit(); session.refresh(conf)
         return conf
-    finally:
-        session.close()
+    finally: session.close()
 
 def fetch_all_orgs():
     session = Session()
-    try:
-        return session.query(MasterOrg).all()
-    finally:
-        session.close()
+    try: return session.query(MasterOrg).all()
+    finally: session.close()
 
-# --- 同期ロジック ---
 async def core_sync_logic(user, guild, all_orgs):
     if user.bot: return None
-    
-    display_name = user.display_name
-    found_orgs = []
-    
-    for org in all_orgs:
-        is_matched = False
-        if org.org_name.lower() in display_name.lower():
-            is_matched = True
-        elif org.alias and org.alias.lower() in display_name.lower():
-            is_matched = True
-        if is_matched:
-            found_orgs.append(org)
-
+    dn = user.display_name
+    found = [o for o in all_orgs if o.org_name.lower() in dn.lower() or (o.alias and o.alias.lower() in dn.lower())]
     conf = get_config(guild.id)
     log_ch = discord.utils.get(guild.text_channels, name=conf.admin_log_channel)
 
-    if len(found_orgs) > 1:
-        org_names_str = ", ".join([o.org_name for o in found_orgs])
-        if log_ch:
-            await log_ch.send(f"🚨 **同期拒否（重複検知）**: {user.mention}\n表示名: `{display_name}`\n検知団体: `{org_names_str}`")
-        return f"🚫 {display_name}: 重複検知のため同期を拒否しました"
+    if len(found) > 1:
+        if log_ch: await log_ch.send(f"🚨 **重複検知**: {user.mention} (表示名: `{dn}`) をスキップしました。")
+        return f"🚫 {dn}: 重複検知"
+    if not found: return f"⚠️ {dn}: 団体なし"
 
-    if not found_orgs:
-        return f"⚠️ {display_name}: 団体名が見つかりません"
+    target = found[0]
+    l_name = None if conf.leader_role_name in ["なし","None","none"] else conf.leader_role_name
+    p_name = None if conf.proxy_role_name in ["なし","None","none"] else conf.proxy_role_name
 
-    target_org = found_orgs[0]
-    skip_keywords = ["なし", "None", "none", "ナシ"]
-    l_role_name = None if conf.leader_role_name in skip_keywords else conf.leader_role_name
-    p_role_name = None if conf.proxy_role_name in skip_keywords else conf.proxy_role_name
-
-    all_org_names = [o.org_name for o in all_orgs]
-    cleanup_list = all_org_names.copy()
-    if l_role_name: cleanup_list.append(l_role_name)
-    if p_role_name: cleanup_list.append(p_role_name)
+    clean = [o.org_name for o in all_orgs]
+    if l_name: clean.append(l_name)
+    if p_name: clean.append(p_name)
     
-    roles_to_remove = [r for r in user.roles if r.name in cleanup_list and r.name != target_org.org_name]
-    if roles_to_remove:
-        await user.remove_roles(*roles_to_remove)
+    to_rem = [r for r in user.roles if r.name in clean and r.name != target.org_name]
+    if to_rem: await user.remove_roles(*to_rem)
 
-    o_role = discord.utils.get(guild.roles, name=target_org.org_name) or await guild.create_role(name=target_org.org_name, mentionable=True)
-    if o_role not in user.roles:
-        await user.add_roles(o_role)
+    o_role = discord.utils.get(guild.roles, name=target.org_name) or await guild.create_role(name=target.org_name, mentionable=True)
+    if o_role not in user.roles: await user.add_roles(o_role)
 
-    if p_role_name and (p_role_name in display_name or "代理" in display_name):
-        p_role = discord.utils.get(guild.roles, name=p_role_name) or await guild.create_role(name=p_role_name)
+    if p_name and (p_name in dn or "代理" in dn):
+        p_role = discord.utils.get(guild.roles, name=p_name) or await guild.create_role(name=p_name)
         await user.add_roles(p_role)
-    elif l_role_name and not target_org.exclude_leader:
-        l_role = discord.utils.get(guild.roles, name=l_role_name) or await guild.create_role(name=l_role_name)
+    elif l_name and not target.exclude_leader:
+        l_role = discord.utils.get(guild.roles, name=l_name) or await guild.create_role(name=l_name)
         await user.add_roles(l_role)
 
-    if target_org.skip_channel:
-        return f"✅ {display_name} 同期完了 (個室なし)"
+    if target.skip_channel: return f"✅ {dn} 同期完了(個室なし)"
 
     cat = discord.utils.get(guild.categories, name=conf.category_name) or await guild.create_category(conf.category_name)
-    ch_name = target_org.org_name.lower().replace(" ", "-")
-    chan = next((c for c in cat.text_channels if ch_name in c.name.lower()), None)
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(read_messages=False),
-        o_role: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-    }
-    if not chan:
-        await guild.create_text_channel(ch_name, category=cat, overwrites=overwrites)
-    else:
-        await chan.edit(overwrites=overwrites)
-    return f"✅ {display_name} 同期完了"
+    ch_n = target.org_name.lower().replace(" ", "-")
+    chan = next((c for c in cat.text_channels if ch_n in c.name.lower()), None)
+    ow = {guild.default_role: discord.PermissionOverwrite(read_messages=False),
+          o_role: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+          guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)}
+    if not chan: await guild.create_text_channel(ch_n, category=cat, overwrites=ow)
+    else: await chan.edit(overwrites=ow)
+    return f"✅ {dn} 同期完了"
 
-# --- Bot 本体 ---
 bot = commands.Bot(command_prefix='!', intents=discord.Intents.all())
 
 @bot.event
 async def on_ready():
     bot.add_view(MultiFunctionView())
-    print(f"✅ Bot Online: {bot.user}")
-    for guild in bot.guilds:
-        conf = get_config(guild.id)
-        channel = discord.utils.get(guild.text_channels, name=conf.admin_log_channel)
-        if channel:
-            async for m in channel.history(limit=10):
-                if m.author == bot.user and "統合管理パネル" in m.content:
-                    await m.delete()
-            await channel.send(f"**【{guild.name} 統合管理パネル】**\n（監視VC: {conf.target_vc_name or '未設定'}）", view=MultiFunctionView())
+    print(f"✅ Online")
+    for g in bot.guilds:
+        c = get_config(g.id)
+        ch = discord.utils.get(g.text_channels, name=c.admin_log_channel)
+        if ch:
+            async for m in ch.history(limit=10):
+                if m.author == bot.user and "統合管理パネル" in m.content: await m.delete()
+            await ch.send(f"**【{g.name} 統合管理パネル】**", view=MultiFunctionView())
 
 @bot.event
-async def on_voice_state_update(member, before, after):
-    if member.bot: return
-    conf = get_config(member.guild.id)
-    if not conf.target_vc_name: return
+async def on_voice_state_update(m, b, a):
+    if m.bot: return
+    c = get_config(m.guild.id)
+    if not c.target_vc_name: return
     s = Session()
     try:
         now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
-        if after.channel and after.channel.name == conf.target_vc_name:
-            s.query(VCState).filter_by(user_id=str(member.id), guild_id=str(member.guild.id), left_at=None).update({VCState.left_at: now})
-            s.add(VCState(guild_id=str(member.guild.id), user_id=str(member.id), user_name=member.display_name, channel_name=after.channel.name))
-        if before.channel and before.channel.name == conf.target_vc_name:
-            if not after.channel or after.channel.name != conf.target_vc_name:
-                record = s.query(VCState).filter_by(user_id=str(member.id), guild_id=str(member.guild.id), left_at=None).first()
-                if record:
-                    record.left_at = now
+        if a.channel and a.channel.name == c.target_vc_name:
+            s.query(VCState).filter_by(user_id=str(m.id), guild_id=str(m.guild.id), left_at=None).update({VCState.left_at: now})
+            s.add(VCState(guild_id=str(m.guild.id), user_id=str(m.id), user_name=m.display_name, channel_name=a.channel.name))
+        if b.channel and b.channel.name == c.target_vc_name:
+            if not a.channel or a.channel.name != c.target_vc_name:
+                rec = s.query(VCState).filter_by(user_id=str(m.id), guild_id=str(m.guild.id), left_at=None).first()
+                if rec: rec.left_at = now
         s.commit()
-    finally:
-        s.close()
+    finally: s.close()
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def list_orgs(ctx):
+    all_o = fetch_all_orgs()
+    if not all_o: return await ctx.send("登録なし")
+    m = "📋 **登録団体一覧**\n```\n団体名 | 略称 | 部長除外 | 個室なし\n----------------------------------\n"
+    for o in all_o: m += f"{o.org_name} | {o.alias or '-'} | {o.exclude_leader} | {o.skip_channel}\n"
+    await ctx.send(m + "```")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def del_org(ctx, name: str):
+    """【管理者】団体名を指定して削除"""
+    s = Session()
+    try:
+        target = s.query(MasterOrg).filter_by(org_name=name).first()
+        if not target: return await ctx.send(f"⚠️ 「{name}」は見つかりませんでした。")
+        s.delete(target); s.commit()
+        await ctx.send(f"✅ 「{name}」を削除しました。")
+    finally: s.close()
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def add_orgs(ctx, *, data: str):
     s = Session()
     try:
-        lines = data.strip().split('\n')
-        success = []
-        for line in lines:
-            parts = line.split()
-            if not parts: continue
+        lines = data.strip().split('\n'); succ = []
+        for l in lines:
+            p = l.split()
+            if not p: continue
             try:
-                org = MasterOrg(
-                    org_name=parts[0], 
-                    alias=parts[1] if len(parts)>1 else None, 
-                    exclude_leader=parts[2].lower()=='true' if len(parts)>2 else False,
-                    skip_channel=parts[3].lower()=='true' if len(parts)>3 else False
-                )
-                s.add(org)
-                s.commit()
-                success.append(parts[0])
-            except:
-                s.rollback()
-        await ctx.send(f"✅ 登録完了: {', '.join(success)}")
-    finally:
-        s.close()
+                o = MasterOrg(org_name=p[0], alias=p[1] if len(p)>1 else None, exclude_leader=p[2].lower()=='true' if len(p)>2 else False, skip_channel=p[3].lower()=='true' if len(p)>3 else False)
+                s.add(o); s.commit(); succ.append(p[0])
+            except: s.rollback()
+        await ctx.send(f"✅ 登録: {', '.join(succ)}")
+    finally: s.close()
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def report(ctx):
-    conf = get_config(ctx.guild.id)
-    if not conf.target_vc_name: return await ctx.send("⚠️ VC設定がありません。")
+    c = get_config(ctx.guild.id)
+    if not c.target_vc_name: return await ctx.send("VC設定なし")
     s = Session()
     try:
-        today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).replace(hour=0, minute=0, second=0, microsecond=0)
-        v_hist = s.query(VCState).filter(VCState.guild_id == str(ctx.guild.id), VCState.joined_at >= today).all()
-        pushed = s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(ctx.guild.id), AttendanceLog.timestamp >= today, AttendanceLog.status.in_(["通常", "代理"])).all()
-        v_ids = {u.user_id: u.user_name for u in v_hist}
-        p_ids = {u.user_id: u.user_name for u in pushed}
-        msg = f"📊 **本日の照合**\n⚠️ 未押下: {', '.join([n for i, n in v_ids.items() if i not in p_ids]) or 'なし'}\n❓ VC履歴なし: {', '.join([n for i, n in p_ids.items() if i not in v_ids]) or 'なし'}"
-        await ctx.send(msg)
-    finally:
-        s.close()
+        t = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).replace(hour=0, minute=0, second=0, microsecond=0)
+        v = {u.user_id: u.user_name for u in s.query(VCState).filter(VCState.guild_id == str(ctx.guild.id), VCState.joined_at >= t).all()}
+        p = {u.user_id: u.user_name for u in s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(ctx.guild.id), AttendanceLog.timestamp >= t, AttendanceLog.status.in_(["通常", "代理"])).all()}
+        await ctx.send(f"📊 照合\n⚠️ 未押下: {', '.join([n for i, n in v.items() if i not in p]) or 'なし'}\n❓ VCなし: {', '.join([n for i, n in p.items() if i not in v]) or 'なし'}")
+    finally: s.close()
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def export_vc(ctx):
     s = Session()
     try:
-        hist = s.query(VCState).filter_by(guild_id=str(ctx.guild.id)).all()
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["ユーザー", "チャンネル", "入室", "退出"])
-        for h in hist:
-            writer.writerow([h.user_name, h.channel_name, h.joined_at, h.left_at or "入室中"])
-        output.seek(0)
-        await ctx.send(file=discord.File(io.BytesIO(output.getvalue().encode()), filename="vc_history.csv"))
-    finally:
-        s.close()
+        h = s.query(VCState).filter_by(guild_id=str(ctx.guild.id)).all()
+        o = io.StringIO(); w = csv.writer(o)
+        w.writerow(["ユーザー", "VC", "入室", "退出"])
+        for x in h: w.writerow([x.user_name, x.channel_name, x.joined_at, x.left_at or "中"])
+        o.seek(0); await ctx.send(file=discord.File(io.BytesIO(o.getvalue().encode()), filename="vc.csv"))
+    finally: s.close()
 
 @bot.command()
 async def sync(ctx):
-    all_orgs = fetch_all_orgs()
-    res = await core_sync_logic(ctx.author, ctx.guild, all_orgs)
+    all_o = fetch_all_orgs()
+    res = await core_sync_logic(ctx.author, ctx.guild, all_o)
     if res: await ctx.send(res)
 
 class MultiFunctionView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-    
+    def __init__(self): super().__init__(timeout=None)
     @discord.ui.button(label="一括同期", style=discord.ButtonStyle.danger, custom_id="sync_all")
     async def sync_all(self, interaction, button):
         if not interaction.user.guild_permissions.administrator: return
-        await interaction.response.send_message("🔄 同期中...", ephemeral=True)
-        all_orgs = fetch_all_orgs()
-        count = 0
+        await interaction.response.send_message("同期中...", ephemeral=True)
+        all_o = fetch_all_orgs(); count = 0
         async for m in interaction.guild.fetch_members(limit=None):
-            res = await core_sync_logic(m, interaction.guild, all_orgs)
+            res = await core_sync_logic(m, interaction.guild, all_o)
             if res and "✅" in res: count += 1
-        await interaction.followup.send(f"📊 完了: {count}名 (重複者はスキップ)")
+        await interaction.followup.send(f"完了: {count}名")
 
     @discord.ui.button(label="通常", style=discord.ButtonStyle.primary, custom_id="att_n")
     async def att_n(self, interaction, button): await self._log(interaction, "通常")
@@ -280,31 +240,22 @@ class MultiFunctionView(discord.ui.View):
 
     async def _log(self, interaction, status):
         await interaction.response.defer(ephemeral=True)
-        all_orgs = fetch_all_orgs()
-        found = [o for o in all_orgs if o.org_name.lower() in interaction.user.display_name.lower() or (o.alias and o.alias.lower() in interaction.user.display_name.lower())]
-        if len(found) != 1:
-            return await interaction.followup.send("🚫 識別失敗または重複あり。")
-        oname = found[0].org_name
+        all_o = fetch_all_orgs()
+        f = [o for o in all_o if o.org_name.lower() in interaction.user.display_name.lower() or (o.alias and o.alias.lower() in interaction.user.display_name.lower())]
+        if len(f) != 1: return await interaction.followup.send("不備あり")
         s = Session()
         try:
-            s.add(AttendanceLog(guild_id=str(interaction.guild.id), user_id=str(interaction.user.id), user_name=interaction.user.display_name, org_name=oname, status=status))
+            s.add(AttendanceLog(guild_id=str(interaction.guild.id), user_id=str(interaction.user.id), user_name=interaction.user.display_name, org_name=f[0].org_name, status=status))
             s.commit()
-        finally:
-            s.close()
-        await interaction.followup.send(f"✅ {oname} {status}記録完了")
+        finally: s.close()
+        await interaction.followup.send(f"✅ {f[0].org_name} {status}")
 
-# --- Flask Server ---
 app = Flask(__name__)
-
 @app.route('/')
-def home():
-    return "Bot is running!", 200
-
+def home(): return "OK", 200
 def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
 if __name__ == "__main__":
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
+    threading.Thread(target=run_flask, daemon=True).start()
     bot.run(os.environ.get("DISCORD_TOKEN"))
