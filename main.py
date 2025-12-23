@@ -82,7 +82,7 @@ async def core_sync_logic(user, guild, all_orgs):
     log_ch = discord.utils.get(guild.text_channels, name=conf.admin_log_channel)
 
     if len(found) > 1:
-        if log_ch: await log_ch.send(f"🚨 **重複検知**: {user.mention} (表示名: `{dn}`) をスキップしました。")
+        if log_ch: await log_ch.send(f"🚨 重複検知: {user.mention} (表示名: {dn}) をスキップしました。")
         return f"🚫 {dn}: 重複検知"
     if not found: return f"⚠️ {dn}: 団体なし"
 
@@ -153,6 +153,39 @@ async def on_voice_state_update(m, b, a):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
+async def set_config(ctx, cat, leader, proxy, log):
+    """【管理者】基本設定の更新"""
+    s = Session()
+    try:
+        conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first()
+        if not conf:
+            conf = ServerConfig(guild_id=str(ctx.guild.id))
+            s.add(conf)
+        conf.category_name = cat
+        conf.leader_role_name = leader
+        conf.proxy_role_name = proxy
+        conf.admin_log_channel = log
+        s.commit()
+        await ctx.send(f"✅ 設定を更新しました。\nカテゴリ: {cat}\n部長役職: {leader}\n代理役職: {proxy}\nログch: {log}")
+    finally: s.close()
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def set_vc(ctx, vc_name):
+    """【管理者】監視VCの設定"""
+    s = Session()
+    try:
+        conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first()
+        if not conf:
+            conf = ServerConfig(guild_id=str(ctx.guild.id))
+            s.add(conf)
+        conf.target_vc_name = vc_name
+        s.commit()
+        await ctx.send(f"✅ 監視VCを「{vc_name}」に設定しました。")
+    finally: s.close()
+
+@bot.command()
+@commands.has_permissions(administrator=True)
 async def list_orgs(ctx):
     all_o = fetch_all_orgs()
     if not all_o: return await ctx.send("登録なし")
@@ -163,13 +196,12 @@ async def list_orgs(ctx):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def del_org(ctx, name: str):
-    """【管理者】団体名を指定して削除"""
     s = Session()
     try:
         target = s.query(MasterOrg).filter_by(org_name=name).first()
-        if not target: return await ctx.send(f"⚠️ 「{name}」は見つかりませんでした。")
+        if not target: return await ctx.send(f"⚠️ {name} なし")
         s.delete(target); s.commit()
-        await ctx.send(f"✅ 「{name}」を削除しました。")
+        await ctx.send(f"✅ {name} 削除")
     finally: s.close()
 
 @bot.command()
@@ -218,6 +250,12 @@ async def sync(ctx):
     all_o = fetch_all_orgs()
     res = await core_sync_logic(ctx.author, ctx.guild, all_o)
     if res: await ctx.send(res)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def panel(ctx):
+    """【管理者】手動でパネルを投稿"""
+    await ctx.send(f"**【{ctx.guild.name} 統合管理パネル】**", view=MultiFunctionView())
 
 class MultiFunctionView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
