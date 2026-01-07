@@ -5,13 +5,13 @@ import io
 import csv
 from flask import Flask
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks  # tasksを追加
 from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Integer
 from sqlalchemy.orm import sessionmaker, declarative_base
 import datetime
 import asyncio
 
-# --- DB設定 (v16) ---
+# --- DB設定 ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -59,6 +59,7 @@ class VCState(Base):
 
 Base.metadata.create_all(engine)
 
+# --- ユーティリティ ---
 def get_config(guild_id):
     session = Session()
     try:
@@ -119,11 +120,30 @@ async def core_sync_logic(user, guild, all_orgs):
     else: await chan.edit(overwrites=ow)
     return f"✅ {dn} 同期完了"
 
+# --- Bot ---
 bot = commands.Bot(command_prefix='!', intents=discord.Intents.all())
+
+# 正午の自動同期タスク
+@tasks.loop(time=datetime.time(hour=12, minute=0, tzinfo=datetime.timezone(datetime.timedelta(hours=9))))
+async def scheduled_sync():
+    print("🕛 定時一括同期を開始します...")
+    all_o = fetch_all_orgs()
+    for guild in bot.guilds:
+        count = 0
+        async for m in guild.fetch_members(limit=None):
+            res = await core_sync_logic(m, guild, all_o)
+            if res and "✅" in res: count += 1
+        
+        conf = get_config(guild.id)
+        log_ch = discord.utils.get(guild.text_channels, name=conf.admin_log_channel)
+        if log_ch:
+            await log_ch.send(f"🕛 **定時自動同期完了**: {count}名の同期処理を行いました。")
 
 @bot.event
 async def on_ready():
     bot.add_view(MultiFunctionView())
+    if not scheduled_sync.is_running():
+        scheduled_sync.start()
     print(f"✅ Online")
     for g in bot.guilds:
         c = get_config(g.id)
@@ -151,58 +171,32 @@ async def on_voice_state_update(m, b, a):
         s.commit()
     finally: s.close()
 
+# --- コマンド ---
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def set_config(ctx, cat, leader, proxy, log):
-    """【管理者】基本設定の更新"""
-    s = Session()
-    try:
-        conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first()
-        if not conf:
-            conf = ServerConfig(guild_id=str(ctx.guild.id))
-            s.add(conf)
-        conf.category_name = cat
-        conf.leader_role_name = leader
-        conf.proxy_role_name = proxy
-        conf.admin_log_channel = log
-        s.commit()
-        await ctx.send(f"✅ 設定を更新しました。\nカテゴリ: {cat}\n部長役職: {leader}\n代理役職: {proxy}\nログch: {log}")
-    finally: s.close()
+    s = Session(); conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first()
+    if not conf: conf = ServerConfig(guild_id=str(ctx.guild.id)); s.add(conf)
+    conf.category_name = cat; conf.leader_role_name = leader; conf.proxy_role_name = proxy; conf.admin_log_channel = log
+    s.commit(); s.close()
+    await ctx.send("✅ 設定更新完了")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def set_vc(ctx, vc_name):
-    """【管理者】監視VCの設定"""
-    s = Session()
-    try:
-        conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first()
-        if not conf:
-            conf = ServerConfig(guild_id=str(ctx.guild.id))
-            s.add(conf)
-        conf.target_vc_name = vc_name
-        s.commit()
-        await ctx.send(f"✅ 監視VCを「{vc_name}」に設定しました。")
-    finally: s.close()
+    s = Session(); conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first()
+    if not conf: conf = ServerConfig(guild_id=str(ctx.guild.id)); s.add(conf)
+    conf.target_vc_name = vc_name; s.commit(); s.close()
+    await ctx.send(f"✅ 監視VC: {vc_name}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def list_orgs(ctx):
     all_o = fetch_all_orgs()
     if not all_o: return await ctx.send("登録なし")
-    m = "📋 **登録団体一覧**\n```\n団体名 | 略称 | 部長除外 | 個室なし\n----------------------------------\n"
+    m = "📋 **登録団体一覧**\n```\n団体名 | 略称 | 部長除外 | 個室なし\n"
     for o in all_o: m += f"{o.org_name} | {o.alias or '-'} | {o.exclude_leader} | {o.skip_channel}\n"
     await ctx.send(m + "```")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def del_org(ctx, name: str):
-    s = Session()
-    try:
-        target = s.query(MasterOrg).filter_by(org_name=name).first()
-        if not target: return await ctx.send(f"⚠️ {name} なし")
-        s.delete(target); s.commit()
-        await ctx.send(f"✅ {name} 削除")
-    finally: s.close()
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -222,40 +216,23 @@ async def add_orgs(ctx, *, data: str):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def report(ctx):
-    c = get_config(ctx.guild.id)
-    if not c.target_vc_name: return await ctx.send("VC設定なし")
-    s = Session()
-    try:
-        t = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).replace(hour=0, minute=0, second=0, microsecond=0)
-        v = {u.user_id: u.user_name for u in s.query(VCState).filter(VCState.guild_id == str(ctx.guild.id), VCState.joined_at >= t).all()}
-        p = {u.user_id: u.user_name for u in s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(ctx.guild.id), AttendanceLog.timestamp >= t, AttendanceLog.status.in_(["通常", "代理"])).all()}
-        await ctx.send(f"📊 照合\n⚠️ 未押下: {', '.join([n for i, n in v.items() if i not in p]) or 'なし'}\n❓ VCなし: {', '.join([n for i, n in p.items() if i not in v]) or 'なし'}")
-    finally: s.close()
+async def del_org(ctx, name: str):
+    s = Session(); t = s.query(MasterOrg).filter_by(org_name=name).first()
+    if t: s.delete(t); s.commit(); await ctx.send(f"✅ {name} 削除")
+    else: await ctx.send("なし"); s.close()
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def export_vc(ctx):
-    s = Session()
-    try:
-        h = s.query(VCState).filter_by(guild_id=str(ctx.guild.id)).all()
-        o = io.StringIO(); w = csv.writer(o)
-        w.writerow(["ユーザー", "VC", "入室", "退出"])
-        for x in h: w.writerow([x.user_name, x.channel_name, x.joined_at, x.left_at or "中"])
-        o.seek(0); await ctx.send(file=discord.File(io.BytesIO(o.getvalue().encode()), filename="vc.csv"))
-    finally: s.close()
+    s = Session(); h = s.query(VCState).filter_by(guild_id=str(ctx.guild.id)).all()
+    o = io.StringIO(); w = csv.writer(o); w.writerow(["ユーザー", "VC", "入室", "退出"])
+    for x in h: w.writerow([x.user_name, x.channel_name, x.joined_at, x.left_at or "中"])
+    o.seek(0); await ctx.send(file=discord.File(io.BytesIO(o.getvalue().encode()), filename="vc.csv")); s.close()
 
 @bot.command()
 async def sync(ctx):
-    all_o = fetch_all_orgs()
-    res = await core_sync_logic(ctx.author, ctx.guild, all_o)
+    res = await core_sync_logic(ctx.author, ctx.guild, fetch_all_orgs())
     if res: await ctx.send(res)
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def panel(ctx):
-    """【管理者】手動でパネルを投稿"""
-    await ctx.send(f"**【{ctx.guild.name} 統合管理パネル】**", view=MultiFunctionView())
 
 class MultiFunctionView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
@@ -291,8 +268,7 @@ class MultiFunctionView(discord.ui.View):
 app = Flask(__name__)
 @app.route('/')
 def home(): return "OK", 200
-def run_flask():
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+def run_flask(): app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
