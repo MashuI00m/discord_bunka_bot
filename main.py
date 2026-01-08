@@ -128,17 +128,24 @@ bot = commands.Bot(command_prefix='!', intents=discord.Intents.all())
 async def scheduled_sync():
     print("🕛 定時一括同期を開始します...")
     all_o = fetch_all_orgs()
+    
+    # Botが参加している「すべてのサーバー」をループ
     for guild in bot.guilds:
+        print(f"📡 サーバー同期中: {guild.name}")
         count = 0
-        async for m in guild.fetch_members(limit=None):
-            res = await core_sync_logic(m, guild, all_o)
-            if res and "✅" in res: count += 1
         
+        # 各サーバーの「全メンバー」をループ
+        async for m in guild.fetch_members(limit=None):
+            # core_sync_logicの中で「役職付与」と「団体個室の権限更新」がセットで行われます
+            res = await core_sync_logic(m, guild, all_o)
+            if res and "✅" in res:
+                count += 1
+        
+        # 各サーバーの「管理ログ」チャンネルに結果を報告
         conf = get_config(guild.id)
         log_ch = discord.utils.get(guild.text_channels, name=conf.admin_log_channel)
         if log_ch:
-            await log_ch.send(f"🕛 **定時自動同期完了**: {count}名の同期処理を行いました。")
-
+            await log_ch.send(f"🕛 **定時自動一括同期完了**\n参加しているすべてのメンバーと団体チャンネルの権限を最新の状態に更新しました。\n（同期成功: {count}名）")
 @bot.event
 async def on_ready():
     bot.add_view(MultiFunctionView())
