@@ -5,7 +5,7 @@ import io
 import csv
 from flask import Flask
 import discord
-from discord.ext import commands, tasks  # tasksを追加
+from discord.ext import commands, tasks
 from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Integer
 from sqlalchemy.orm import sessionmaker, declarative_base
 import datetime
@@ -75,6 +75,26 @@ def fetch_all_orgs():
     try: return session.query(MasterOrg).all()
     finally: session.close()
 
+async def get_or_create_category_with_space(guild, base_name, target_ch_name=None):
+    """
+    指定した名前のカテゴリー群から空き（50未満）があるものを探す。
+    既存のチャンネルがある場合はそのカテゴリーを優先して返す。
+    """
+    if target_ch_name:
+        existing_ch = discord.utils.get(guild.text_channels, name=target_ch_name)
+        if existing_ch and existing_ch.category and base_name in existing_ch.category.name:
+            return existing_ch.category
+
+    suffix = 1
+    while True:
+        name = base_name if suffix == 1 else f"{base_name}-{suffix}"
+        cat = discord.utils.get(guild.categories, name=name)
+        if not cat:
+            return await guild.create_category(name)
+        if len(cat.channels) < 50:
+            return cat
+        suffix += 1
+
 async def core_sync_logic(user, guild, all_orgs):
     if user.bot: return None
     dn = user.display_name
@@ -110,47 +130,40 @@ async def core_sync_logic(user, guild, all_orgs):
 
     if target.skip_channel: return f"✅ {dn} 同期完了(個室なし)"
 
-    cat = discord.utils.get(guild.categories, name=conf.category_name) or await guild.create_category(conf.category_name)
     ch_n = target.org_name.lower().replace(" ", "-")
-    chan = next((c for c in cat.text_channels if ch_n in c.name.lower()), None)
+    cat = await get_or_create_category_with_space(guild, conf.category_name, ch_n)
+    
+    chan = discord.utils.get(guild.text_channels, name=ch_n)
     ow = {guild.default_role: discord.PermissionOverwrite(read_messages=False),
           o_role: discord.PermissionOverwrite(read_messages=True, send_messages=True),
           guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)}
-    if not chan: await guild.create_text_channel(ch_n, category=cat, overwrites=ow)
-    else: await chan.edit(overwrites=ow)
+    
+    if not chan: 
+        await guild.create_text_channel(ch_n, category=cat, overwrites=ow)
+    else: 
+        if chan.category != cat: await chan.edit(category=cat)
+        await chan.edit(overwrites=ow)
     return f"✅ {dn} 同期完了"
 
 # --- Bot ---
 bot = commands.Bot(command_prefix='!', intents=discord.Intents.all())
 
-# 正午の自動同期タスク
 @tasks.loop(time=datetime.time(hour=12, minute=0, tzinfo=datetime.timezone(datetime.timedelta(hours=9))))
 async def scheduled_sync():
-    print("🕛 定時一括同期を開始します...")
     all_o = fetch_all_orgs()
-    
-    # Botが参加している「すべてのサーバー」をループ
     for guild in bot.guilds:
-        print(f"📡 サーバー同期中: {guild.name}")
         count = 0
-        
-        # 各サーバーの「全メンバー」をループ
         async for m in guild.fetch_members(limit=None):
-            # core_sync_logicの中で「役職付与」と「団体個室の権限更新」がセットで行われます
             res = await core_sync_logic(m, guild, all_o)
-            if res and "✅" in res:
-                count += 1
-        
-        # 各サーバーの「管理ログ」チャンネルに結果を報告
+            if res and "✅" in res: count += 1
         conf = get_config(guild.id)
         log_ch = discord.utils.get(guild.text_channels, name=conf.admin_log_channel)
-        if log_ch:
-            await log_ch.send(f"🕛 **定時自動一括同期完了**\n参加しているすべてのメンバーと団体チャンネルの権限を最新の状態に更新しました。\n（同期成功: {count}名）")
+        if log_ch: await log_ch.send(f"🕛 **定時自動同期完了**: {count}名の処理を行いました。")
+
 @bot.event
 async def on_ready():
     bot.add_view(MultiFunctionView())
-    if not scheduled_sync.is_running():
-        scheduled_sync.start()
+    if not scheduled_sync.is_running(): scheduled_sync.start()
     print(f"✅ Online")
     for g in bot.guilds:
         c = get_config(g.id)
@@ -179,6 +192,11 @@ async def on_voice_state_update(m, b, a):
     finally: s.close()
 
 # --- コマンド ---
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def panel(ctx):
+    await ctx.send(f"**【{ctx.guild.name} 統合管理パネル】**", view=MultiFunctionView())
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def set_config(ctx, cat, leader, proxy, log):
@@ -226,7 +244,8 @@ async def add_orgs(ctx, *, data: str):
 async def del_org(ctx, name: str):
     s = Session(); t = s.query(MasterOrg).filter_by(org_name=name).first()
     if t: s.delete(t); s.commit(); await ctx.send(f"✅ {name} 削除")
-    else: await ctx.send("なし"); s.close()
+    else: await ctx.send("なし")
+    s.close()
 
 @bot.command()
 @commands.has_permissions(administrator=True)
