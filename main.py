@@ -75,25 +75,16 @@ def fetch_all_orgs():
     try: return session.query(MasterOrg).all()
     finally: session.close()
 
-async def get_or_create_category_with_space(guild, base_name, target_ch_name=None):
-    """
-    指定した名前のカテゴリー群から空き（50未満）があるものを探す。
-    既存のチャンネルがある場合はそのカテゴリーを優先して返す。
-    """
-    if target_ch_name:
-        existing_ch = discord.utils.get(guild.text_channels, name=target_ch_name)
-        if existing_ch and existing_ch.category and base_name in existing_ch.category.name:
-            return existing_ch.category
-
-    suffix = 1
-    while True:
-        name = base_name if suffix == 1 else f"{base_name}-{suffix}"
+async def find_best_category(guild, category_names, target_ch_name):
+    cat_list = [c.strip() for c in category_names.split(',')]
+    existing_ch = discord.utils.get(guild.text_channels, name=target_ch_name)
+    if existing_ch and existing_ch.category and existing_ch.category.name in cat_list:
+        return existing_ch.category
+    for name in cat_list:
         cat = discord.utils.get(guild.categories, name=name)
-        if not cat:
-            return await guild.create_category(name)
-        if len(cat.channels) < 50:
-            return cat
-        suffix += 1
+        if cat and len(cat.channels) < 50: return cat
+        if not cat: return await guild.create_category(name)
+    return discord.utils.get(guild.categories, name=cat_list[-1])
 
 async def core_sync_logic(user, guild, all_orgs):
     if user.bot: return None
@@ -101,49 +92,59 @@ async def core_sync_logic(user, guild, all_orgs):
     found = [o for o in all_orgs if o.org_name.lower() in dn.lower() or (o.alias and o.alias.lower() in dn.lower())]
     conf = get_config(guild.id)
     log_ch = discord.utils.get(guild.text_channels, name=conf.admin_log_channel)
-
     if len(found) > 1:
-        if log_ch: await log_ch.send(f"🚨 重複検知: {user.mention} (表示名: {dn}) をスキップしました。")
+        if log_ch: await log_ch.send(f"🚨 重複検知: {user.mention} (表示名: {dn}) をスキップ。")
         return f"🚫 {dn}: 重複検知"
     if not found: return f"⚠️ {dn}: 団体なし"
-
     target = found[0]
     l_name = None if conf.leader_role_name in ["なし","None","none"] else conf.leader_role_name
     p_name = None if conf.proxy_role_name in ["なし","None","none"] else conf.proxy_role_name
-
     clean = [o.org_name for o in all_orgs]
     if l_name: clean.append(l_name)
     if p_name: clean.append(p_name)
-    
     to_rem = [r for r in user.roles if r.name in clean and r.name != target.org_name]
     if to_rem: await user.remove_roles(*to_rem)
-
     o_role = discord.utils.get(guild.roles, name=target.org_name) or await guild.create_role(name=target.org_name, mentionable=True)
     if o_role not in user.roles: await user.add_roles(o_role)
-
     if p_name and (p_name in dn or "代理" in dn):
         p_role = discord.utils.get(guild.roles, name=p_name) or await guild.create_role(name=p_name)
         await user.add_roles(p_role)
     elif l_name and not target.exclude_leader:
         l_role = discord.utils.get(guild.roles, name=l_name) or await guild.create_role(name=l_name)
         await user.add_roles(l_role)
-
-    if target.skip_channel: return f"✅ {dn} 同期完了(個室なし)"
-
+    if target.skip_channel: return f"✅ {dn} 同期完了"
     ch_n = target.org_name.lower().replace(" ", "-")
-    cat = await get_or_create_category_with_space(guild, conf.category_name, ch_n)
-    
+    cat = await find_best_category(guild, conf.category_name, ch_n)
     chan = discord.utils.get(guild.text_channels, name=ch_n)
     ow = {guild.default_role: discord.PermissionOverwrite(read_messages=False),
           o_role: discord.PermissionOverwrite(read_messages=True, send_messages=True),
           guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)}
-    
-    if not chan: 
-        await guild.create_text_channel(ch_n, category=cat, overwrites=ow)
-    else: 
+    if not chan: await guild.create_text_channel(ch_n, category=cat, overwrites=ow)
+    else:
         if chan.category != cat: await chan.edit(category=cat)
         await chan.edit(overwrites=ow)
     return f"✅ {dn} 同期完了"
+
+async def get_attendance_report_msg(guild):
+    s = Session()
+    try:
+        jst = datetime.timezone(datetime.timedelta(hours=9))
+        t = datetime.datetime.now(jst).replace(hour=0, minute=0, second=0, microsecond=0)
+        logs = s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(guild.id), AttendanceLog.timestamp >= t).all()
+        if not logs: return "📋 **出席最終集計**\n本日の記録はありません。"
+        rep, others, proxies = {}, [], []
+        for l in logs:
+            if l.status == "代理": proxies.append(f"{l.user_name} ({l.org_name})")
+            elif l.org_name == "その他" or not l.org_name: others.append(l.user_name)
+            else:
+                if l.org_name not in rep: rep[l.org_name] = []
+                rep[l.org_name].append(l.user_name)
+        m = "📋 **出席最終集計**\n\n**出席:**\n"
+        for o, us in rep.items(): m += f"{o}: {', '.join(us)}\n"
+        if others: m += f"その他: {', '.join(others)}\n"
+        if proxies: m += "\n**代理:**\n" + "\n".join([f"代理:{p}" for p in proxies])
+        return m
+    finally: s.close()
 
 # --- Bot ---
 bot = commands.Bot(command_prefix='!', intents=discord.Intents.all())
@@ -151,20 +152,17 @@ bot = commands.Bot(command_prefix='!', intents=discord.Intents.all())
 @tasks.loop(time=datetime.time(hour=12, minute=0, tzinfo=datetime.timezone(datetime.timedelta(hours=9))))
 async def scheduled_sync():
     all_o = fetch_all_orgs()
-    for guild in bot.guilds:
-        count = 0
-        async for m in guild.fetch_members(limit=None):
-            res = await core_sync_logic(m, guild, all_o)
-            if res and "✅" in res: count += 1
-        conf = get_config(guild.id)
-        log_ch = discord.utils.get(guild.text_channels, name=conf.admin_log_channel)
-        if log_ch: await log_ch.send(f"🕛 **定時自動同期完了**: {count}名の処理を行いました。")
+    for g in bot.guilds:
+        async for m in g.fetch_members(limit=None): await core_sync_logic(m, g, all_o)
+        conf = get_config(g.id)
+        log_ch = discord.utils.get(g.text_channels, name=conf.admin_log_channel)
+        if log_ch: await log_ch.send(await get_attendance_report_msg(g))
 
 @bot.event
 async def on_ready():
     bot.add_view(MultiFunctionView())
     if not scheduled_sync.is_running(): scheduled_sync.start()
-    print(f"✅ Online")
+    print("✅ Online")
     for g in bot.guilds:
         c = get_config(g.id)
         ch = discord.utils.get(g.text_channels, name=c.admin_log_channel)
@@ -191,7 +189,6 @@ async def on_voice_state_update(m, b, a):
         s.commit()
     finally: s.close()
 
-# --- コマンド ---
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def panel(ctx):
@@ -204,15 +201,7 @@ async def set_config(ctx, cat, leader, proxy, log):
     if not conf: conf = ServerConfig(guild_id=str(ctx.guild.id)); s.add(conf)
     conf.category_name = cat; conf.leader_role_name = leader; conf.proxy_role_name = proxy; conf.admin_log_channel = log
     s.commit(); s.close()
-    await ctx.send("✅ 設定更新完了")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def set_vc(ctx, vc_name):
-    s = Session(); conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first()
-    if not conf: conf = ServerConfig(guild_id=str(ctx.guild.id)); s.add(conf)
-    conf.target_vc_name = vc_name; s.commit(); s.close()
-    await ctx.send(f"✅ 監視VC: {vc_name}")
+    await ctx.send(f"✅ 更新: {cat} / {leader} / {proxy} / {log}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -247,19 +236,6 @@ async def del_org(ctx, name: str):
     else: await ctx.send("なし")
     s.close()
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def export_vc(ctx):
-    s = Session(); h = s.query(VCState).filter_by(guild_id=str(ctx.guild.id)).all()
-    o = io.StringIO(); w = csv.writer(o); w.writerow(["ユーザー", "VC", "入室", "退出"])
-    for x in h: w.writerow([x.user_name, x.channel_name, x.joined_at, x.left_at or "中"])
-    o.seek(0); await ctx.send(file=discord.File(io.BytesIO(o.getvalue().encode()), filename="vc.csv")); s.close()
-
-@bot.command()
-async def sync(ctx):
-    res = await core_sync_logic(ctx.author, ctx.guild, fetch_all_orgs())
-    if res: await ctx.send(res)
-
 class MultiFunctionView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
     @discord.ui.button(label="一括同期", style=discord.ButtonStyle.danger, custom_id="sync_all")
@@ -281,15 +257,16 @@ class MultiFunctionView(discord.ui.View):
 
     async def _log(self, interaction, status):
         await interaction.response.defer(ephemeral=True)
-        all_o = fetch_all_orgs()
-        f = [o for o in all_o if o.org_name.lower() in interaction.user.display_name.lower() or (o.alias and o.alias.lower() in interaction.user.display_name.lower())]
-        if len(f) != 1: return await interaction.followup.send("不備あり")
+        all_o = fetch_all_orgs(); dn = interaction.user.display_name
+        found = [o for o in all_o if o.org_name.lower() in dn.lower() or (o.alias and o.alias.lower() in dn.lower())]
+        if not found: return await interaction.followup.send("❌ 不備あり: ニックネームに団体名が見つかりません。")
+        if len(found) > 1: return await interaction.followup.send(f"❌ 不備あり: 複数団体（{','.join([o.org_name for o in found])}）が検知されました。")
         s = Session()
         try:
-            s.add(AttendanceLog(guild_id=str(interaction.guild.id), user_id=str(interaction.user.id), user_name=interaction.user.display_name, org_name=f[0].org_name, status=status))
+            s.add(AttendanceLog(guild_id=str(interaction.guild.id), user_id=str(interaction.user.id), user_name=dn, org_name=found[0].org_name, status=status))
             s.commit()
+            await interaction.followup.send(f"✅ {found[0].org_name} として「{status}」を記録しました。")
         finally: s.close()
-        await interaction.followup.send(f"✅ {f[0].org_name} {status}")
 
 app = Flask(__name__)
 @app.route('/')
