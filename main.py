@@ -122,6 +122,13 @@ async def on_ready():
     bot.add_view(MultiFunctionView())
     if not scheduled_sync.is_running(): scheduled_sync.start()
     print("✅ Online")
+    for g in bot.guilds:
+        c = get_config(g.id)
+        ch = discord.utils.get(g.text_channels, name=c.admin_log_channel)
+        if ch:
+            async for m in ch.history(limit=10):
+                if m.author == bot.user and "統合管理パネル" in m.content: await m.delete()
+            await ch.send(f"**【{g.name} 統合管理パネル】**", view=MultiFunctionView())
 
 @bot.event
 async def on_voice_state_update(m, b, a):
@@ -152,13 +159,11 @@ async def on_voice_state_update(m, b, a):
 @commands.has_permissions(administrator=True)
 async def vc_sync(ctx):
     conf = get_config(ctx.guild.id)
-    if not conf.target_vc_name: return await ctx.send("❌ 監視VC未設定。!set_vc チャンネル名 で設定してください。")
+    if not conf.target_vc_name: return await ctx.send("❌ 監視VC未設定。!set_vc で設定してください。")
     vc = discord.utils.get(ctx.guild.voice_channels, name=conf.target_vc_name)
     if not vc: return await ctx.send(f"❌ VC『{conf.target_vc_name}』が見つかりません。")
     members = [m.display_name for m in vc.members]
-    txt = f"📊 **VC出席確認レポート ({vc.name})**\n"
-    txt += f"取得時刻: {datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).strftime('%Y/%m/%d %H:%M')}\n"
-    txt += f"現在の人数: {len(members)}名\n```\n" + (", ".join(members) if members else "入室者はいません。") + "\n```"
+    txt = f"📊 **VC出席確認レポート ({vc.name})**\n現在の人数: {len(members)}名\n```\n" + (", ".join(members) if members else "入室者はいません。") + "\n```"
     await ctx.send(txt)
 
 @bot.command()
@@ -185,15 +190,6 @@ async def set_vc(ctx, vc_name):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def list_orgs(ctx):
-    all_o = fetch_all_orgs()
-    if not all_o: return await ctx.send("登録なし")
-    m = "📋 **登録団体一覧**\n```\n団体名 | 略称 | 部長除外 | 個室なし\n"
-    for o in all_o: m += f"{o.org_name} | {o.alias or '-'} | {o.exclude_leader} | {o.skip_channel}\n"
-    await ctx.send(m + "```")
-
-@bot.command()
-@commands.has_permissions(administrator=True)
 async def add_orgs(ctx, *, data: str):
     s = Session()
     try:
@@ -215,6 +211,14 @@ async def del_org(ctx, name: str):
     if t: s.delete(t); s.commit(); await ctx.send(f"✅ {name} 削除")
     else: await ctx.send("なし")
     s.close()
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def export_vc(ctx):
+    s = Session(); h = s.query(VCState).filter_by(guild_id=str(ctx.guild.id)).all()
+    o = io.StringIO(); w = csv.writer(o); w.writerow(["ユーザー", "VC", "入室", "退出"])
+    for x in h: w.writerow([x.user_name, x.channel_name, x.joined_at, x.left_at or "中"])
+    o.seek(0); await ctx.send(file=discord.File(io.BytesIO(o.getvalue().encode()), filename="vc.csv")); s.close()
 
 @bot.command()
 async def sync(ctx):
