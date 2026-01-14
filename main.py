@@ -124,16 +124,22 @@ async def on_ready():
     print("✅ Online")
     for g in bot.guilds:
         c = get_config(g.id)
-        ch = discord.utils.get(g.text_channels, name=c.admin_log_channel)
-        if ch:
-            async for m in ch.history(limit=10):
-                if m.author == bot.user and "統合管理パネル" in m.content: await m.delete()
-            await ch.send(f"**【{g.name} 統合管理パネル】**", view=MultiFunctionView())
+        # チャンネル名で検索。見つからない場合はスルー
+        target_ch = discord.utils.get(g.text_channels, name=c.admin_log_channel)
+        if target_ch:
+            try:
+                # 過去のパネル（自分自身の投稿かつ特定文言を含むもの）を削除
+                async for m in target_ch.history(limit=20):
+                    if m.author == bot.user and "統合管理パネル" in m.content:
+                        await m.delete()
+                # 最新のパネルを送信
+                await target_ch.send(f"**【{g.name} 統合管理パネル】**", view=MultiFunctionView())
+            except Exception as e:
+                print(f"パネル送信失敗 ({g.name}): {e}")
 
 @bot.event
 async def on_voice_state_update(m, b, a):
-    if m.bot: return
-    if b.channel == a.channel: return
+    if m.bot or b.channel == a.channel: return
     c = get_config(m.guild.id)
     if not c.target_vc_name: return
     s = Session()
@@ -151,19 +157,18 @@ async def on_voice_state_update(m, b, a):
                 s.add(VCState(guild_id=str(m.guild.id), user_id=str(m.id), user_name=m.display_name, channel_name=a.channel.name))
                 s.commit()
     except Exception as e:
-        print(f"VCログエラー: {e}")
-        s.rollback()
+        print(f"VCログエラー: {e}"); s.rollback()
     finally: s.close()
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def vc_sync(ctx):
     conf = get_config(ctx.guild.id)
-    if not conf.target_vc_name: return await ctx.send("❌ 監視VC未設定。!set_vc で設定してください。")
+    if not conf.target_vc_name: return await ctx.send("❌ 監視VC未設定。")
     vc = discord.utils.get(ctx.guild.voice_channels, name=conf.target_vc_name)
-    if not vc: return await ctx.send(f"❌ VC『{conf.target_vc_name}』が見つかりません。")
+    if not vc: return await ctx.send(f"❌ VC『{conf.target_vc_name}』なし。")
     members = [m.display_name for m in vc.members]
-    txt = f"📊 **VC出席確認レポート ({vc.name})**\n現在の人数: {len(members)}名\n```\n" + (", ".join(members) if members else "入室者はいません。") + "\n```"
+    txt = f"📊 **VC出席確認 ({vc.name})**\n人数: {len(members)}名\n```\n" + (", ".join(members) if members else "なし") + "\n```"
     await ctx.send(txt)
 
 @bot.command()
@@ -186,22 +191,21 @@ async def set_vc(ctx, vc_name):
     s = Session(); conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first()
     if not conf: conf = ServerConfig(guild_id=str(ctx.guild.id)); s.add(conf)
     conf.target_vc_name = vc_name; s.commit(); s.close()
-    await ctx.send(f"✅ 監視対象VCを『{vc_name}』に設定しました。")
+    await ctx.send(f"✅ 監視VC設定: {vc_name}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def add_orgs(ctx, *, data: str):
     s = Session()
     try:
-        lines = data.strip().split('\n')
-        for l in lines:
+        for l in data.strip().split('\n'):
             p = l.split()
             if not p: continue
             try:
                 o = MasterOrg(org_name=p[0], alias=p[1] if len(p)>1 else None, exclude_leader=p[2].lower()=='true' if len(p)>2 else False, skip_channel=p[3].lower()=='true' if len(p)>3 else False)
                 s.add(o); s.commit()
             except: s.rollback()
-        await ctx.send(f"✅ 団体登録完了")
+        await ctx.send(f"✅ 登録完了")
     finally: s.close()
 
 @bot.command()
