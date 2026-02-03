@@ -1,5 +1,5 @@
 discord.py
 Flask
-sqlalchemy
-requests 
+SQLAlchemy
 psycopg2-binary
+gunicorn
