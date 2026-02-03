@@ -35,20 +35,13 @@ class ServerConfig(Base):
 class AttendanceLog(Base):
     __tablename__ = 'attendance_log_v16'
     id = Column(Integer, primary_key=True, autoincrement=True)
-    guild_id = Column(String)
-    user_id = Column(String)
-    user_name = Column(String)
-    org_name = Column(String)
-    status = Column(String)
+    guild_id = Column(String); user_id = Column(String); user_name = Column(String); org_name = Column(String); status = Column(String)
     timestamp = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))))
 
 class VCState(Base):
     __tablename__ = 'vc_history_v16'
     id = Column(Integer, primary_key=True, autoincrement=True)
-    guild_id = Column(String)
-    user_id = Column(String)
-    user_name = Column(String)
-    channel_name = Column(String)
+    guild_id = Column(String); user_id = Column(String); user_name = Column(String); channel_name = Column(String)
     joined_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))))
     left_at = Column(DateTime, nullable=True)
 
@@ -72,9 +65,6 @@ def fetch_all_orgs():
 
 async def find_best_category(guild, category_names, target_ch_name):
     cat_list = [c.strip() for c in category_names.split(',')]
-    existing_ch = discord.utils.get(guild.text_channels, name=target_ch_name)
-    if existing_ch and existing_ch.category and existing_ch.category.name in cat_list:
-        return existing_ch.category
     for name in cat_list:
         cat = discord.utils.get(guild.categories, name=name)
         if cat and len(cat.channels) < 50: return cat
@@ -101,15 +91,13 @@ async def core_sync_logic(user, guild, all_orgs):
     elif l_name and not target.exclude_leader:
         l_role = discord.utils.get(guild.roles, name=l_name) or await guild.create_role(name=l_name)
         await user.add_roles(l_role)
-    if target.skip_channel: return True
-    ch_n = target.org_name.lower().replace(" ", "-")
-    cat = await find_best_category(guild, conf.category_name, ch_n)
-    chan = discord.utils.get(guild.text_channels, name=ch_n)
-    ow = {guild.default_role: discord.PermissionOverwrite(read_messages=False), o_role: discord.PermissionOverwrite(read_messages=True), guild.me: discord.PermissionOverwrite(read_messages=True)}
-    if not chan: await guild.create_text_channel(ch_n, category=cat, overwrites=ow)
-    else:
-        if chan.category != cat: await chan.edit(category=cat)
-        await chan.edit(overwrites=ow)
+    if not target.skip_channel:
+        ch_n = target.org_name.lower().replace(" ", "-"); cat = await find_best_category(guild, conf.category_name, ch_n); chan = discord.utils.get(guild.text_channels, name=ch_n)
+        ow = {guild.default_role: discord.PermissionOverwrite(read_messages=False), o_role: discord.PermissionOverwrite(read_messages=True), guild.me: discord.PermissionOverwrite(read_messages=True)}
+        if not chan: await guild.create_text_channel(ch_n, category=cat, overwrites=ow)
+        else:
+            if chan.category != cat: await chan.edit(category=cat)
+            await chan.edit(overwrites=ow)
     return True
 
 async def get_combined_report(guild, mode="button"):
@@ -117,22 +105,18 @@ async def get_combined_report(guild, mode="button"):
     try:
         all_o = s.query(MasterOrg).all(); conf = get_config(guild.id); target_user_ids = set()
         if mode == "button":
-            jst = datetime.timezone(datetime.timedelta(hours=9))
-            t_start = datetime.datetime.now(jst).replace(hour=0, minute=0, second=0, microsecond=0)
-            logs = s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(guild.id), AttendanceLog.timestamp >= t_start).all()
-            target_user_ids = {l.user_id for l in logs}
+            t = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).replace(hour=0, minute=0, second=0, microsecond=0)
+            target_user_ids = {l.user_id for l in s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(guild.id), AttendanceLog.timestamp >= t).all()}
             title = "📋 **出席レポート (ボタン)**"
         else:
-            vc = discord.utils.get(guild.voice_channels, name=conf.target_vc_name)
-            if vc: target_user_ids = {str(m.id) for m in vc.members}
+            vc = discord.utils.get(guild.voice_channels, name=conf.target_vc_name); target_user_ids = {str(m.id) for m in vc.members} if vc else set()
             title = f"🎙️ **VC出席レポート ({conf.target_vc_name or '未設定'})**"
-        m = f"{title}\n\n**出席状況:**\n"
-        for org in all_o:
-            role = discord.utils.get(guild.roles, name=org.org_name)
-            if not role: m += f"{org.org_name}: ロール未作成\n"; continue
-            present = [member.display_name for member in role.members if str(member.id) in target_user_ids]
-            m += f"{org.org_name}: {', '.join(present) if present else '不参加'}\n"
-        return m
+        res = f"{title}\n\n**出席状況:**\n"
+        for o in all_o:
+            r = discord.utils.get(guild.roles, name=o.org_name)
+            p = [member.display_name for member in r.members if str(member.id) in target_user_ids] if r else []
+            res += f"{o.org_name}: {', '.join(p) if p else '不参加'}\n"
+        return res
     finally: s.close()
 
 # --- Bot本体 ---
@@ -145,12 +129,14 @@ async def scheduled_sync():
         count = 0
         async for m in g.fetch_members(limit=None):
             if await core_sync_logic(m, g, all_o): count += 1
-        conf = get_config(g.id); log_ch = discord.utils.get(g.text_channels, name=conf.admin_log_channel)
-        if log_ch: await log_ch.send(f"🕛 **定時自動同期完了**: {count}名を更新。")
+        conf = get_config(g.id); ch = discord.utils.get(g.text_channels, name=conf.admin_log_channel)
+        if ch: await ch.send(f"🕛 **定時自動同期完了**: {count}名を更新。")
 
 @bot.event
 async def on_ready():
-    bot.add_view(MultiFunctionView()); if not scheduled_sync.is_running(): scheduled_sync.start()
+    bot.add_view(MultiFunctionView())
+    if not scheduled_sync.is_running():
+        scheduled_sync.start()
     print("✅ Bot Online")
     for g in bot.guilds:
         c = get_config(g.id); ch = discord.utils.get(g.text_channels, name=c.admin_log_channel)
@@ -187,11 +173,11 @@ async def report_vc(ctx): await ctx.send(await get_combined_report(ctx.guild, mo
 @commands.has_permissions(administrator=True)
 async def report_reset(ctx):
     s = Session(); t = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).replace(hour=0, minute=0, second=0, microsecond=0)
-    s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(ctx.guild.id), AttendanceLog.timestamp >= t).delete(); s.commit(); s.close(); await ctx.send("✅ 出席ログリセット完了")
+    s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(ctx.guild.id), AttendanceLog.timestamp >= t).delete(); s.commit(); s.close(); await ctx.send("✅ 出席ログリセット")
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def list_orgs(ctx):
-    all_o = fetch_all_orgs(); m = "📋 **団体一覧**\n" + "\n".join([f"・{o.org_name} ({o.alias or 'なし'})" for o in all_o]); await ctx.send(m if all_o else "登録なし")
+    all_o = fetch_all_orgs(); m = "📋 **団体一覧**\n" + "\n".join([f"・{o.org_name} ({o.alias or 'なし'})" for o in all_o]); await ctx.send(m if all_o else "なし")
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def add_orgs(ctx, *, data: str):
@@ -225,7 +211,9 @@ async def export_vc(ctx):
     o.seek(0); await ctx.send(file=discord.File(io.BytesIO(o.getvalue().encode()), filename="vc.csv")); s.close()
 @bot.command()
 async def sync(ctx):
-    all_o = fetch_all_orgs(); if await core_sync_logic(ctx.author, ctx.guild, all_o): await ctx.send("✅ 同期完了")
+    all_o = fetch_all_orgs(); 
+    if await core_sync_logic(ctx.author, ctx.guild, all_o):
+        await ctx.send("✅ 同期完了")
 
 class MultiFunctionView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
@@ -242,8 +230,7 @@ class MultiFunctionView(discord.ui.View):
     @discord.ui.button(label="代理出席", style=discord.ButtonStyle.danger, custom_id="att_p")
     async def att_p(self, interaction, button): await self._log(interaction, "代理出席")
     async def _log(self, interaction, status):
-        await interaction.response.defer(ephemeral=True)
-        all_o = fetch_all_orgs(); dn = interaction.user.display_name; found = [o for o in all_o if o.org_name.lower() in dn.lower() or (o.alias and o.alias.lower() in dn.lower())]; org_name = found[0].org_name if found else "その他"; s = Session()
+        await interaction.response.defer(ephemeral=True); all_o = fetch_all_orgs(); dn = interaction.user.display_name; found = [o for o in all_o if o.org_name.lower() in dn.lower() or (o.alias and o.alias.lower() in dn.lower())]; org_name = found[0].org_name if found else "その他"; s = Session()
         try:
             s.add(AttendanceLog(guild_id=str(interaction.guild.id), user_id=str(interaction.user.id), user_name=dn, org_name=org_name, status=status)); s.commit(); await interaction.followup.send(f"✅ {org_name} {status}記録完了", ephemeral=True)
         except: s.rollback()
