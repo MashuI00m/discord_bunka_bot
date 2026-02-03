@@ -57,7 +57,6 @@ class VCState(Base):
 
 Base.metadata.create_all(engine)
 
-# --- ユーティリティ ---
 def get_config(guild_id):
     session = Session()
     try:
@@ -131,7 +130,7 @@ async def get_combined_report(guild, mode="button"):
             t_start = datetime.datetime.now(jst).replace(hour=0, minute=0, second=0, microsecond=0)
             logs = s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(guild.id), AttendanceLog.timestamp >= t_start).all()
             target_user_ids = {l.user_id for l in logs}
-            title = "📋 **手動出席レポート (ボタン)**"
+            title = "📋 **出席レポート (ボタン)**"
         else:
             vc = discord.utils.get(guild.voice_channels, name=conf.target_vc_name)
             if vc: target_user_ids = {str(m.id) for m in vc.members}
@@ -161,8 +160,7 @@ async def scheduled_sync():
         conf = get_config(g.id)
         log_ch = discord.utils.get(g.text_channels, name=conf.admin_log_channel)
         if log_ch:
-            # レポートは送らず、同期完了の通知のみ送信
-            await log_ch.send(f"🕛 **定時自動ロール同期完了**: {count}名の役職・権限を更新しました。")
+            await log_ch.send(f"🕛 **定時自動同期完了**: {count}名を更新。")
 
 @bot.event
 async def on_ready():
@@ -171,11 +169,11 @@ async def on_ready():
     print("✅ Online")
     for g in bot.guilds:
         c = get_config(g.id)
-        target_ch = discord.utils.get(g.text_channels, name=c.admin_log_channel)
-        if target_ch:
-            async for m in target_ch.history(limit=20):
+        ch = discord.utils.get(g.text_channels, name=c.admin_log_channel)
+        if ch:
+            async for m in ch.history(limit=20):
                 if m.author == bot.user and "統合管理パネル" in m.content: await m.delete()
-            await target_ch.send(f"**【{g.name} 統合管理パネル】**", view=MultiFunctionView())
+            await ch.send(f"**【{g.name} 統合管理パネル】**", view=MultiFunctionView())
 
 @bot.event
 async def on_voice_state_update(m, b, a):
@@ -197,32 +195,28 @@ async def on_voice_state_update(m, b, a):
     except: s.rollback()
     finally: s.close()
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def report(ctx):
-    await ctx.send(await get_combined_report(ctx.guild, mode="button"))
+# --- 全コマンド確認済み ---
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def report_mid(ctx):
-    await ctx.send("⌛ **中間集計を出力します**")
-    await ctx.send(await get_combined_report(ctx.guild, mode="button"))
+async def report(ctx): await ctx.send(await get_combined_report(ctx.guild, mode="button"))
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def report_vc(ctx):
-    await ctx.send(await get_combined_report(ctx.guild, mode="vc"))
+async def report_mid(ctx): await ctx.send(await get_combined_report(ctx.guild, mode="button"))
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def report_vc(ctx): await ctx.send(await get_combined_report(ctx.guild, mode="vc"))
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def report_reset(ctx):
     s = Session()
     try:
-        jst = datetime.timezone(datetime.timedelta(hours=9))
-        t_start = datetime.datetime.now(jst).replace(hour=0, minute=0, second=0, microsecond=0)
-        s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(ctx.guild.id), AttendanceLog.timestamp >= t_start).delete()
-        s.commit()
-        await ctx.send("✅ 本日の出席ボタン記録をリセットしました。")
+        t = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).replace(hour=0, minute=0, second=0, microsecond=0)
+        s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(ctx.guild.id), AttendanceLog.timestamp >= t).delete()
+        s.commit(); await ctx.send("✅ リセット完了")
     finally: s.close()
 
 @bot.command()
@@ -230,15 +224,22 @@ async def report_reset(ctx):
 async def set_config(ctx, cat, l, p, log):
     s = Session(); conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first()
     if not conf: conf = ServerConfig(guild_id=str(ctx.guild.id)); s.add(conf)
-    conf.category_name=cat; conf.leader_role_name=l; conf.proxy_role_name=p; conf.admin_log_channel=log
-    s.commit(); s.close(); await ctx.send("✅ 設定を更新しました。")
+    conf.category_name, conf.leader_role_name, conf.proxy_role_name, conf.admin_log_channel = cat, l, p, log
+    s.commit(); s.close(); await ctx.send("✅ 設定更新")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def set_vc(ctx, name):
     s = Session(); conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first()
     if not conf: conf = ServerConfig(guild_id=str(ctx.guild.id)); s.add(conf)
-    conf.target_vc_name=name; s.commit(); s.close(); await ctx.send(f"✅ 監視VCを設定しました: {name}")
+    conf.target_vc_name=name; s.commit(); s.close(); await ctx.send(f"✅ VC設定: {name}")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def list_orgs(ctx):
+    all_o = fetch_all_orgs()
+    m = "📋 **団体一覧**\n" + "\n".join([f"・{o.org_name} (略称: {o.alias or 'なし'})" for o in all_o])
+    await ctx.send(m if all_o else "登録なし")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -247,13 +248,32 @@ async def add_orgs(ctx, *, data: str):
     try:
         for l in data.strip().split('\n'):
             p = l.split()
-            if not p: continue
-            try:
-                o = MasterOrg(org_name=p[0], alias=p[1] if len(p)>1 else None, exclude_leader=p[2].lower()=='true' if len(p)>2 else False, skip_channel=p[3].lower()=='true' if len(p)>3 else False)
-                s.add(o); s.commit()
-            except: s.rollback()
-        await ctx.send("✅ 団体登録が完了しました。")
+            if len(p) < 1: continue
+            o = MasterOrg(org_name=p[0], alias=p[1] if len(p)>1 else None, exclude_leader=p[2].lower()=='true' if len(p)>2 else False, skip_channel=p[3].lower()=='true' if len(p)>3 else False)
+            s.merge(o)
+        s.commit(); await ctx.send("✅ 登録完了")
     finally: s.close()
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def del_org(ctx, name: str):
+    s = Session(); t = s.query(MasterOrg).filter_by(org_name=name).first()
+    if t: s.delete(t); s.commit(); await ctx.send(f"✅ {name} 削除")
+    else: await ctx.send("見つかりません")
+    s.close()
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def export_vc(ctx):
+    s = Session(); h = s.query(VCState).filter_by(guild_id=str(ctx.guild.id)).all()
+    o = io.StringIO(); w = csv.writer(o); w.writerow(["ユーザー", "VC", "入室", "退出"])
+    for x in h: w.writerow([x.user_name, x.channel_name, x.joined_at, x.left_at or "中"])
+    o.seek(0); await ctx.send(file=discord.File(io.BytesIO(o.getvalue().encode()), filename="vc.csv")); s.close()
+
+@bot.command()
+async def sync(ctx):
+    res = await core_sync_logic(ctx.author, ctx.guild, fetch_all_orgs())
+    if res: await ctx.send(res)
 
 class MultiFunctionView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
@@ -265,7 +285,7 @@ class MultiFunctionView(discord.ui.View):
         async for m in interaction.guild.fetch_members(limit=None):
             res = await core_sync_logic(m, interaction.guild, all_o)
             if res and "✅" in res: count += 1
-        await interaction.followup.send(f"完了: {count}名")
+        await interaction.followup.send(f"完了: {count}名", ephemeral=True)
 
     @discord.ui.button(label="部長出席", style=discord.ButtonStyle.primary, custom_id="att_n")
     async def att_n(self, interaction, button): await self._log(interaction, "部長出席")
@@ -280,7 +300,7 @@ class MultiFunctionView(discord.ui.View):
         s = Session()
         try:
             s.add(AttendanceLog(guild_id=str(interaction.guild.id), user_id=str(interaction.user.id), user_name=dn, org_name=org_name, status=status))
-            s.commit(); await interaction.followup.send(f"✅ {org_name} {status}を記録しました。")
+            s.commit(); await interaction.followup.send(f"✅ {org_name} {status}記録完了", ephemeral=True)
         finally: s.close()
 
 app = Flask(__name__)
