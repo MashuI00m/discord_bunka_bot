@@ -1,13 +1,13 @@
 import os
-import threading
 import io
 import csv
 import datetime
-from flask import Flask
 import discord
+from flask import Flask
 from discord.ext import commands, tasks
 from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Integer
 from sqlalchemy.orm import sessionmaker, declarative_base
+import threading
 
 # --- DB設定 ---
 DATABASE_URL = os.environ.get("DATABASE_URL", "").replace("postgres://", "postgresql://", 1)
@@ -47,7 +47,7 @@ class VCState(Base):
 
 Base.metadata.create_all(engine)
 
-# --- 共通ユーティリティ ---
+# --- 共通ロジック ---
 def get_config(guild_id):
     session = Session()
     try:
@@ -73,13 +73,10 @@ async def find_best_category(guild, category_names, target_ch_name):
 
 async def core_sync_logic(user, guild, all_orgs):
     if user.bot: return None
-    dn = user.display_name
-    found = [o for o in all_orgs if o.org_name.lower() in dn.lower() or (o.alias and o.alias.lower() in dn.lower())]
+    dn = user.display_name; found = [o for o in all_orgs if o.org_name.lower() in dn.lower() or (o.alias and o.alias.lower() in dn.lower())]
     conf = get_config(guild.id)
     if len(found) != 1: return None
-    target = found[0]
-    l_name = None if conf.leader_role_name in ["なし","none"] else conf.leader_role_name
-    p_name = None if conf.proxy_role_name in ["なし","none"] else conf.proxy_role_name
+    target = found[0]; l_name = None if conf.leader_role_name in ["なし", "none"] else conf.leader_role_name; p_name = None if conf.proxy_role_name in ["なし", "none"] else conf.proxy_role_name
     clean = [o.org_name for o in all_orgs] + ([l_name] if l_name else []) + ([p_name] if p_name else [])
     to_rem = [r for r in user.roles if r.name in clean and r.name != target.org_name]
     if to_rem: await user.remove_roles(*to_rem)
@@ -93,7 +90,7 @@ async def core_sync_logic(user, guild, all_orgs):
         await user.add_roles(l_role)
     if not target.skip_channel:
         ch_n = target.org_name.lower().replace(" ", "-"); cat = await find_best_category(guild, conf.category_name, ch_n); chan = discord.utils.get(guild.text_channels, name=ch_n)
-        ow = {guild.default_role: discord.PermissionOverwrite(read_messages=False), o_role: discord.PermissionOverwrite(read_messages=True), guild.me: discord.PermissionOverwrite(read_messages=True)}
+        ow = {guild.default_role: discord.PermissionOverwrite(read_messages=False), o_role: discord.PermissionOverwrite(read_messages=True, send_messages=True), guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)}
         if not chan: await guild.create_text_channel(ch_n, category=cat, overwrites=ow)
         else:
             if chan.category != cat: await chan.edit(category=cat)
@@ -163,21 +160,26 @@ async def on_voice_state_update(m, b, a):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def report(ctx): await ctx.send(await get_combined_report(ctx.guild, mode="button"))
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def report_mid(ctx): await ctx.send(await get_combined_report(ctx.guild, mode="button"))
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def report_vc(ctx): await ctx.send(await get_combined_report(ctx.guild, mode="vc"))
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def report_reset(ctx):
     s = Session(); t = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).replace(hour=0, minute=0, second=0, microsecond=0)
-    s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(ctx.guild.id), AttendanceLog.timestamp >= t).delete(); s.commit(); s.close(); await ctx.send("✅ 出席ログリセット")
+    s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(ctx.guild.id), AttendanceLog.timestamp >= t).delete(); s.commit(); s.close(); await ctx.send("✅ 出席ログリセット完了")
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def list_orgs(ctx):
     all_o = fetch_all_orgs(); m = "📋 **団体一覧**\n" + "\n".join([f"・{o.org_name} ({o.alias or 'なし'})" for o in all_o]); await ctx.send(m if all_o else "なし")
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def add_orgs(ctx, *, data: str):
@@ -186,35 +188,40 @@ async def add_orgs(ctx, *, data: str):
         p = l.split()
         if p: s.merge(MasterOrg(org_name=p[0], alias=p[1] if len(p)>1 else None, exclude_leader=p[2].lower()=='true' if len(p)>2 else False, skip_channel=p[3].lower()=='true' if len(p)>3 else False))
     s.commit(); s.close(); await ctx.send("✅ 登録完了")
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def del_org(ctx, name: str):
     s = Session(); t = s.query(MasterOrg).filter_by(org_name=name).first()
-    if t: s.delete(t); s.commit(); await ctx.send(f"✅ {name} 削除")
-    else: await ctx.send("なし")
+    if t: s.delete(t); s.commit(); await ctx.send(f"✅ {name} 削除完了")
+    else: await ctx.send("見つかりません")
     s.close()
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def set_config(ctx, cat, l, p, log):
     s = Session(); conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first() or ServerConfig(guild_id=str(ctx.guild.id)); s.add(conf)
     conf.category_name, conf.leader_role_name, conf.proxy_role_name, conf.admin_log_channel = cat, l, p, log; s.commit(); s.close(); await ctx.send("✅ 設定更新")
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def set_vc(ctx, name):
     s = Session(); conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first() or ServerConfig(guild_id=str(ctx.guild.id)); s.add(conf)
     conf.target_vc_name=name; s.commit(); s.close(); await ctx.send(f"✅ VC設定: {name}")
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def export_vc(ctx):
     s = Session(); h = s.query(VCState).filter_by(guild_id=str(ctx.guild.id)).all(); o = io.StringIO(); w = csv.writer(o); w.writerow(["名前", "VC", "入室", "退出"])
     for x in h: w.writerow([x.user_name, x.channel_name, x.joined_at, x.left_at or "中"])
     o.seek(0); await ctx.send(file=discord.File(io.BytesIO(o.getvalue().encode()), filename="vc.csv")); s.close()
+
 @bot.command()
 async def sync(ctx):
-    all_o = fetch_all_orgs(); 
-    if await core_sync_logic(ctx.author, ctx.guild, all_o):
-        await ctx.send("✅ 同期完了")
+    all_o = fetch_all_orgs()
+    if await core_sync_logic(ctx.author, ctx.guild, all_o): await ctx.send("✅ 同期完了")
 
+# --- UIパネル ---
 class MultiFunctionView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
     @discord.ui.button(label="一括同期", style=discord.ButtonStyle.danger, custom_id="sync_all")
@@ -225,10 +232,13 @@ class MultiFunctionView(discord.ui.View):
         async for m in interaction.guild.fetch_members(limit=None):
             if await core_sync_logic(m, interaction.guild, all_o): count += 1
         await interaction.followup.send(f"同期完了: {count}名", ephemeral=True)
+
     @discord.ui.button(label="部長出席", style=discord.ButtonStyle.primary, custom_id="att_n")
     async def att_n(self, interaction, button): await self._log(interaction, "部長出席")
+
     @discord.ui.button(label="代理出席", style=discord.ButtonStyle.danger, custom_id="att_p")
     async def att_p(self, interaction, button): await self._log(interaction, "代理出席")
+
     async def _log(self, interaction, status):
         await interaction.response.defer(ephemeral=True); all_o = fetch_all_orgs(); dn = interaction.user.display_name; found = [o for o in all_o if o.org_name.lower() in dn.lower() or (o.alias and o.alias.lower() in dn.lower())]; org_name = found[0].org_name if found else "その他"; s = Session()
         try:
@@ -240,6 +250,8 @@ class MultiFunctionView(discord.ui.View):
 app = Flask(__name__)
 @app.route('/')
 def home(): return "OK", 200
+
 if __name__ == "__main__":
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)), debug=False, use_reloader=False), daemon=True).start()
+    # RenderのStart Commandで gunicorn が Flask を起動するため、
+    # ここでは Discord Bot のみを起動する
     bot.run(os.environ.get("DISCORD_TOKEN"))
