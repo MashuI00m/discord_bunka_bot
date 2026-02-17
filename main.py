@@ -6,7 +6,7 @@ from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Integer
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import OperationalError
 
-# --- DB設定 (オレゴン↔日本間の遅延対策) ---
+# --- DB設定 (オレゴン↔日本間のラグ対策) ---
 DATABASE_URL = os.environ.get("DATABASE_URL", "").replace("postgres://", "postgresql://", 1)
 engine = create_engine(
     DATABASE_URL, 
@@ -161,7 +161,15 @@ async def on_voice_state_update(m, b, a):
     except: s.rollback()
     finally: s.close()
 
-# --- 管理コマンド完全復旧 ---
+# --- コマンド一覧 ---
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def panel(ctx):
+    async for m in ctx.channel.history(limit=20):
+        if m.author == bot.user and "統合管理パネル" in m.content: await m.delete()
+    await ctx.send(f"**【{ctx.guild.name} 統合管理パネル】**", view=MultiFunctionView())
+    await ctx.message.delete()
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def report(ctx): await ctx.send(await get_combined_report(ctx.guild, mode="button"))
@@ -175,13 +183,13 @@ async def report_vc(ctx): await ctx.send(await get_combined_report(ctx.guild, mo
 async def report_reset(ctx):
     s = Session(); t = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).replace(hour=0, minute=0, second=0, microsecond=0)
     s.query(AttendanceLog).filter(AttendanceLog.guild_id == str(ctx.guild.id), AttendanceLog.timestamp >= t).delete()
-    s.commit(); s.close(); await ctx.send("✅ 本日の出席ログをリセットしました。")
+    s.commit(); s.close(); await ctx.send("✅ 出席ログリセット完了")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def list_orgs(ctx):
     all_o = fetch_all_orgs(); m = "📋 **登録団体一覧**\n" + "\n".join([f"・{o.org_name} (略称: {o.alias or 'なし'})" for o in all_o])
-    await ctx.send(m if all_o else "団体が登録されていません。")
+    await ctx.send(m if all_o else "なし")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -190,14 +198,14 @@ async def add_orgs(ctx, *, data: str):
     for l in data.strip().split('\n'):
         p = l.split()
         if p: s.merge(MasterOrg(org_name=p[0], alias=p[1] if len(p)>1 else None, exclude_leader=p[2].lower()=='true' if len(p)>2 else False, skip_channel=p[3].lower()=='true' if len(p)>3 else False))
-    s.commit(); s.close(); await ctx.send("✅ 団体情報を追加/更新しました。")
+    s.commit(); s.close(); await ctx.send("✅ 団体登録完了")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def del_org(ctx, name: str):
     s = Session(); t = s.query(MasterOrg).filter_by(org_name=name).first()
-    if t: s.delete(t); s.commit(); await ctx.send(f"✅ 「{name}」を削除しました。")
-    else: await ctx.send("該当する団体が見つかりません。")
+    if t: s.delete(t); s.commit(); await ctx.send(f"✅ {name} 削除完了")
+    else: await ctx.send("該当団体なし")
     s.close()
 
 @bot.command()
@@ -205,26 +213,26 @@ async def del_org(ctx, name: str):
 async def set_config(ctx, cat, l, p, log):
     s = Session(); conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first() or ServerConfig(guild_id=str(ctx.guild.id)); s.add(conf)
     conf.category_name, conf.leader_role_name, conf.proxy_role_name, conf.admin_log_channel = cat, l, p, log
-    s.commit(); s.close(); await ctx.send("✅ サーバー設定を更新しました。")
+    s.commit(); s.close(); await ctx.send("✅ 設定更新完了")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def set_vc(ctx, name):
     s = Session(); conf = s.query(ServerConfig).filter_by(guild_id=str(ctx.guild.id)).first() or ServerConfig(guild_id=str(ctx.guild.id)); s.add(conf)
-    conf.target_vc_name = name; s.commit(); s.close(); await ctx.send(f"✅ 出席対象VCを「{name}」に設定しました。")
+    conf.target_vc_name = name; s.commit(); s.close(); await ctx.send(f"✅ VC設定完了: {name}")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def export_vc(ctx):
     s = Session(); h = s.query(VCState).filter_by(guild_id=str(ctx.guild.id)).all(); o = io.StringIO(); w = csv.writer(o)
-    w.writerow(["名前", "VC名", "入室時間", "退出時間"])
+    w.writerow(["名前", "VC名", "入室", "退出"])
     for x in h: w.writerow([x.user_name, x.channel_name, x.joined_at, x.left_at or "通話中"])
     o.seek(0); await ctx.send(file=discord.File(io.BytesIO(o.getvalue().encode()), filename="vc_log.csv")); s.close()
 
 @bot.command()
 async def sync(ctx):
     all_o = fetch_all_orgs()
-    if await core_sync_logic(ctx.author, ctx.guild, all_o): await ctx.send("✅ 同期が完了しました。")
+    if await core_sync_logic(ctx.author, ctx.guild, all_o): await ctx.send("✅ 同期完了")
 
 # --- UIパネル ---
 class MultiFunctionView(discord.ui.View):
@@ -232,7 +240,7 @@ class MultiFunctionView(discord.ui.View):
     @discord.ui.button(label="一括同期", style=discord.ButtonStyle.danger, custom_id="sync_all")
     async def sync_all(self, interaction, button):
         if not interaction.user.guild_permissions.administrator: return
-        await interaction.response.send_message("一括同期を開始...", ephemeral=True)
+        await interaction.response.send_message("一括同期中...", ephemeral=True)
         all_o = fetch_all_orgs(); count = 0
         async for m in interaction.guild.fetch_members(limit=None):
             if await core_sync_logic(m, interaction.guild, all_o): count += 1
@@ -246,10 +254,13 @@ class MultiFunctionView(discord.ui.View):
     async def att_p(self, interaction, button): await self._log(interaction, "代理出席")
 
     async def _log(self, interaction, status):
-        await interaction.response.defer(ephemeral=True); all_o = fetch_all_orgs(); dn = interaction.user.display_name; found = [o for o in all_o if o.org_name.lower() in dn.lower() or (o.alias and o.alias.lower() in dn.lower())]; org_name = found[0].org_name if found else "その他"; s = Session()
+        await interaction.response.defer(ephemeral=True); all_o = fetch_all_orgs(); dn = interaction.user.display_name
+        found = [o for o in all_o if o.org_name.lower() in dn.lower() or (o.alias and o.alias.lower() in dn.lower())]
+        org_name = found[0].org_name if found else "その他"
+        s = Session()
         try:
             s.add(AttendanceLog(guild_id=str(interaction.guild.id), user_id=str(interaction.user.id), user_name=dn, org_name=org_name, status=status)); s.commit()
-            await interaction.followup.send(f"✅ {org_name} {status}を記録しました。", ephemeral=True)
+            await interaction.followup.send(f"✅ {org_name} {status}記録完了", ephemeral=True)
         except: s.rollback()
         finally: s.close()
 
